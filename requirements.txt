@@ -1,0 +1,4 @@
+# pyuvc must come from git: the PyPI wheel (pupil-labs-uvc 1.0.0b7) is built
+# against an older libuvc and fails to open any camera.  See setup/install.sh
+# and docs/USB-BANDWIDTH.md.
+pupil-labs-uvc @ git+https://github.com/pupil-labs/pyuvc

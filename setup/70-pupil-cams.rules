@@ -1,0 +1,17 @@
+# Pupil Core cameras -- prepare them for user space capture with libuvc.
+#
+# Why this file exists: the kernel's uvcvideo driver always reserves the largest
+# isochronous altsetting these cameras advertise (3072 bytes per microframe), so
+# the two cameras of a single headset cannot stream at the same time -- the
+# second one fails with ENOSPC / "Not enough bandwidth for altsetting 6".
+# libuvc negotiates a smaller payload and all four cameras fit.
+# See docs/USB-BANDWIDTH.md for the measurements.
+#
+# 1. Raw USB access, both for a local desktop session (uaccess) and for a
+#    headless/service login (plugdev group).
+SUBSYSTEM=="usb", ATTR{idVendor}=="05a3", ATTR{idProduct}=="9232", MODE="0660", GROUP="plugdev", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTR{idVendor}=="0c45", ATTR{idProduct}=="64ab", MODE="0660", GROUP="plugdev", TAG+="uaccess"
+
+# 2. Keep uvcvideo off these cameras: unbind the moment it claims an interface.
+ACTION=="add|bind", SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_interface", DRIVER=="uvcvideo", ATTRS{idVendor}=="05a3", ATTRS{idProduct}=="9232", RUN+="/bin/sh -c 'echo %k > /sys/bus/usb/drivers/uvcvideo/unbind'"
+ACTION=="add|bind", SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_interface", DRIVER=="uvcvideo", ATTRS{idVendor}=="0c45", ATTRS{idProduct}=="64ab", RUN+="/bin/sh -c 'echo %k > /sys/bus/usb/drivers/uvcvideo/unbind'"

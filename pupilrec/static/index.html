@@ -1,0 +1,297 @@
+<!doctype html>
+<html lang="hu">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>Pupil Core felvevő</title>
+<style>
+  :root {
+    --bg: #14161a;
+    --panel: #1e2229;
+    --panel-2: #262b34;
+    --line: #333a45;
+    --text: #e8ebef;
+    --muted: #9aa4b2;
+    --accent: #4c8dff;
+    --rec: #e5484d;
+    --ok: #3dd68c;
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 15px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
+  }
+  header {
+    display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+    padding: 14px 18px; background: var(--panel); border-bottom: 1px solid var(--line);
+    position: sticky; top: 0; z-index: 10;
+  }
+  h1 { font-size: 17px; margin: 0; font-weight: 600; letter-spacing: .2px; }
+  .spacer { flex: 1; }
+  .pill {
+    display: inline-flex; align-items: center; gap: 8px; padding: 6px 12px;
+    border-radius: 999px; background: var(--panel-2); font-size: 13px; color: var(--muted);
+  }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--muted); }
+  .dot.on { background: var(--ok); }
+  .dot.rec { background: var(--rec); animation: blink 1s steps(2, start) infinite; }
+  @keyframes blink { to { visibility: hidden; } }
+  #elapsed { font-variant-numeric: tabular-nums; font-size: 15px; color: var(--text); }
+
+  button {
+    font: inherit; font-weight: 600; color: #fff; border: 0; border-radius: 12px;
+    padding: 13px 26px; background: var(--accent); cursor: pointer; min-height: 48px;
+  }
+  button.rec { background: var(--rec); }
+  button:disabled { opacity: .45; cursor: default; }
+  input[type=text], select {
+    font: inherit; color: var(--text); background: var(--panel-2);
+    border: 1px solid var(--line); border-radius: 10px; padding: 11px 12px; min-height: 46px;
+  }
+  input[type=text] { width: 190px; }
+
+  main { padding: 18px; display: grid; gap: 18px; }
+  .headset {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 14px; overflow: hidden;
+  }
+  .headset > h2 {
+    margin: 0; padding: 11px 16px; font-size: 13px; font-weight: 600;
+    text-transform: uppercase; letter-spacing: .09em; color: var(--muted);
+    border-bottom: 1px solid var(--line);
+  }
+  .cams { display: grid; grid-template-columns: 3fr 1fr; gap: 1px; background: var(--line); }
+  @media (max-width: 720px) { .cams { grid-template-columns: 1fr; } }
+  .cam { background: var(--panel); display: flex; flex-direction: column; }
+  .cam figure { margin: 0; background: #000; aspect-ratio: 16 / 9; display: grid; place-items: center; }
+  .cam.eye figure { aspect-ratio: 1 / 1; }
+  .cam img { width: 100%; height: 100%; object-fit: contain; display: block; }
+  .meta {
+    display: flex; align-items: center; gap: 10px; padding: 9px 13px;
+    font-size: 12.5px; color: var(--muted);
+  }
+  .meta .name { color: var(--text); font-weight: 600; }
+  .meta .num { font-variant-numeric: tabular-nums; }
+  .warn { color: var(--rec); }
+
+  #recordings { padding: 0 18px 28px; }
+  #recordings h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .09em; color: var(--muted); }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--line); }
+  th { color: var(--muted); font-weight: 600; }
+  td.num { font-variant-numeric: tabular-nums; }
+  #toast {
+    position: fixed; left: 50%; bottom: 26px; transform: translateX(-50%);
+    background: var(--panel-2); border: 1px solid var(--line); border-radius: 10px;
+    padding: 12px 18px; opacity: 0; transition: opacity .25s; pointer-events: none; max-width: 90vw;
+  }
+  #toast.show { opacity: 1; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Pupil Core felvevő</h1>
+  <span class="pill"><span class="dot" id="linkDot"></span><span id="linkText">kapcsolódás…</span></span>
+  <span class="pill" id="recPill" hidden><span class="dot rec"></span><span id="elapsed">00:00</span></span>
+  <span class="spacer"></span>
+  <label class="pill">Előnézet
+    <select id="previewFps">
+      <option value="5">5 fps</option>
+      <option value="10" selected>10 fps</option>
+      <option value="15">15 fps</option>
+      <option value="25">25 fps</option>
+    </select>
+  </label>
+  <input type="text" id="recName" placeholder="felvétel neve (opcionális)" autocapitalize="off" autocorrect="off">
+  <button id="recBtn" disabled>Felvétel indítása</button>
+</header>
+
+<main id="grid"></main>
+
+<section id="recordings">
+  <h2>Korábbi felvételek</h2>
+  <table><thead><tr><th>Név</th><th>Kezdés</th><th class="num">Hossz</th><th>Képkockák</th></tr></thead>
+  <tbody id="recRows"></tbody></table>
+</section>
+
+<div id="toast"></div>
+
+<script>
+const LABELS = { left: "Bal oldali port", right: "Jobb oldali port" };
+const ROLES  = { world: "Főkamera", eye: "Szemkamera" };
+
+let recording = false;
+let built = false;
+let wakeLock = null;
+
+const $ = (id) => document.getElementById(id);
+
+function toast(msg, isError) {
+  const el = $("toast");
+  el.textContent = msg;
+  el.style.borderColor = isError ? "var(--rec)" : "var(--line)";
+  el.classList.add("show");
+  clearTimeout(el._t);
+  el._t = setTimeout(() => el.classList.remove("show"), 3600);
+}
+
+function streamUrl(id) {
+  return `/stream/${id}?fps=${$("previewFps").value}&t=${Date.now()}`;
+}
+
+/* iOS Safari has historically been unreliable with multipart/x-mixed-replace.
+   If the stream image fails, that camera falls back to polling snapshots. */
+function attachStream(img, id) {
+  img.dataset.mode = "stream";
+  img.onerror = () => { if (img.dataset.mode === "stream") startPolling(img, id); };
+  img.src = streamUrl(id);
+}
+function startPolling(img, id) {
+  img.dataset.mode = "poll";
+  img.onerror = null;
+  const tick = () => {
+    if (img.dataset.mode !== "poll") return;
+    img.src = `/snapshot/${id}?t=${Date.now()}`;
+  };
+  img.onload = () => setTimeout(tick, 1000 / Number($("previewFps").value));
+  tick();
+}
+
+function build(cameras) {
+  const bySide = {};
+  cameras.forEach(c => (bySide[c.side] = bySide[c.side] || []).push(c));
+  const grid = $("grid");
+  grid.innerHTML = "";
+
+  Object.keys(bySide).sort().forEach(side => {
+    const section = document.createElement("section");
+    section.className = "headset";
+    section.innerHTML = `<h2>${LABELS[side] || side}</h2><div class="cams"></div>`;
+    const cams = section.querySelector(".cams");
+
+    bySide[side].sort((a, b) => a.role === "world" ? -1 : 1).forEach(cam => {
+      const div = document.createElement("div");
+      div.className = `cam ${cam.role}`;
+      div.innerHTML = `
+        <figure><img alt="${cam.id}" id="img-${cam.id}"></figure>
+        <div class="meta">
+          <span class="name">${ROLES[cam.role] || cam.role}</span>
+          <span>${cam.width}×${cam.height}</span>
+          <span class="num" id="fps-${cam.id}">–</span>
+          <span class="spacer" style="flex:1"></span>
+          <span class="num" id="cnt-${cam.id}"></span>
+        </div>`;
+      cams.appendChild(div);
+      attachStream(div.querySelector("img"), cam.id);
+    });
+    grid.appendChild(section);
+  });
+  built = true;
+}
+
+function reattachAll() {
+  document.querySelectorAll("main img").forEach(img => {
+    const id = img.id.replace("img-", "");
+    img.dataset.mode = "";
+    attachStream(img, id);
+  });
+}
+
+function fmtDuration(s) {
+  s = Math.max(0, Math.round(s));
+  return String(Math.floor(s / 60)).padStart(2, "0") + ":" + String(s % 60).padStart(2, "0");
+}
+
+async function refresh() {
+  let st;
+  try {
+    st = await (await fetch("/api/status", { cache: "no-store" })).json();
+  } catch {
+    $("linkDot").className = "dot";
+    $("linkText").textContent = "nincs kapcsolat";
+    return;
+  }
+  $("linkDot").className = "dot on";
+  $("linkText").textContent = `${st.cameras.filter(c => c.connected).length}/${st.cameras.length} kamera`;
+
+  if (!built && st.cameras.length) build(st.cameras);
+
+  st.cameras.forEach(c => {
+    const fps = $(`fps-${c.id}`), cnt = $(`cnt-${c.id}`);
+    if (fps) {
+      fps.textContent = c.connected ? `${c.fps.toFixed(1)} fps` : "nincs jel";
+      fps.className = "num" + (c.connected ? "" : " warn");
+    }
+    if (cnt) {
+      const bad = c.dropped_queue > 0;
+      cnt.textContent = st.recording ? `${c.recorded} kép${bad ? ` (${c.dropped_queue} kiesett)` : ""}` : "";
+      cnt.className = "num" + (bad ? " warn" : "");
+    }
+  });
+
+  recording = st.recording;
+  $("recPill").hidden = !recording;
+  $("elapsed").textContent = fmtDuration(st.elapsed_s);
+  const btn = $("recBtn");
+  btn.disabled = st.cameras.length === 0;
+  btn.textContent = recording ? "Felvétel leállítása" : "Felvétel indítása";
+  btn.className = recording ? "rec" : "";
+  $("recName").disabled = recording;
+}
+
+async function loadRecordings() {
+  try {
+    const { recordings } = await (await fetch("/api/recordings", { cache: "no-store" })).json();
+    $("recRows").innerHTML = recordings.map(r => {
+      const frames = r.frames ? Object.entries(r.frames).map(([k, v]) => `${k}: ${v}`).join(", ") : "—";
+      return `<tr><td>${r.name}</td><td>${(r.started_iso || "").replace("T", " ").slice(0, 19)}</td>
+              <td class="num">${r.duration_s != null ? fmtDuration(r.duration_s) : (r.complete ? "—" : "folyamatban")}</td>
+              <td>${frames}</td></tr>`;
+    }).join("");
+  } catch { /* listing is optional */ }
+}
+
+$("recBtn").onclick = async () => {
+  const btn = $("recBtn");
+  btn.disabled = true;
+  try {
+    if (!recording) {
+      const res = await fetch("/api/start", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: $("recName").value }),
+      });
+      const body = await res.json();
+      if (!res.ok) throw new Error(body.error || "ismeretlen hiba");
+      toast("Felvétel indul: " + body.name);
+      try { wakeLock = await navigator.wakeLock?.request("screen"); } catch {}
+    } else {
+      const res = await fetch("/api/stop", { method: "POST" });
+      const body = await res.json();
+      if (!res.ok) throw new Error(body.error || "ismeretlen hiba");
+      const total = body.cameras.reduce((a, c) => a + c.frames, 0);
+      toast(`Felvétel kész: ${body.name} — ${fmtDuration(body.duration_s)}, ${total} képkocka`);
+      try { await wakeLock?.release(); } catch {}
+      wakeLock = null;
+      loadRecordings();
+    }
+  } catch (e) {
+    toast(e.message, true);
+  }
+  await refresh();
+  loadRecordings();
+};
+
+$("previewFps").onchange = reattachAll;
+
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible") { reattachAll(); refresh(); }
+});
+
+refresh();
+loadRecordings();
+setInterval(refresh, 1000);
+</script>
+</body>
+</html>
