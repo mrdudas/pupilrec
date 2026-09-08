@@ -31,6 +31,7 @@ DTYPES = {
 }
 TIMESTAMP_BYTES = 8      # one double per frame
 BLOCK_HEADER_BYTES = 4   # uint32 cumulative payload counter
+MAX_PLAUSIBLE_GAP = 1 << 26   # 64 MB; larger means a counter reset, not loss
 
 
 class ComponentStream:
@@ -57,6 +58,7 @@ class ComponentStream:
         self.block_payload = 0        # learned from the first block
         self.lost_bytes = 0           # gaps seen in the block counter
         self.bad_timestamps = 0       # frames whose stamp had to be synthesised
+        self.resyncs = 0              # block counter jumps that were not data loss
         self.samples_seen = 0
         self._last_delta = 0.0        # last believable gap between frame stamps
 
@@ -96,9 +98,17 @@ class ComponentStream:
             counter = struct.unpack_from("<I", self._raw, 0)[0]
             if self._counter is not None:
                 expected = self._counter + self.block_payload
-                if counter != expected:
+                gap = counter - expected
+                if 0 < gap <= MAX_PLAUSIBLE_GAP:
                     # The board kept producing while we were not reading.
-                    self.lost_bytes += max(0, counter - expected)
+                    self.lost_bytes += gap
+                elif gap != 0:
+                    # Either the counter restarted (a new log session) or we are
+                    # reading a block boundary that is not really one.  Neither
+                    # is lost data, so resynchronise instead of inventing a
+                    # number: a stale byte in the buffer once produced a
+                    # "660 GB lost" report this way.
+                    self.resyncs += 1
             self._counter = counter
 
             out += self._raw[BLOCK_HEADER_BYTES:block]

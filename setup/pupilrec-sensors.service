@@ -18,8 +18,13 @@ ExecStart=/home/zsolt/aimotive/.venv/bin/python /home/zsolt/aimotive/run_sensors
 # presses reset, so give the daemon time to stop the log cleanly.
 KillSignal=SIGTERM
 TimeoutStopSec=30
-Restart=on-failure
+Restart=always
 RestartSec=10
+# A board wedged by an earlier crash cannot be recovered in software, so after a
+# few failed retries systemd should stop and show the unit as failed rather than
+# restart forever while nothing gets recorded.
+StartLimitIntervalSec=600
+StartLimitBurst=10
 
 [Install]
 WantedBy=multi-user.target

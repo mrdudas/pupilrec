@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import signal
+import sys
 import threading
 import time
 import urllib.error
@@ -30,6 +31,8 @@ logger = logging.getLogger(__name__)
 STATUS_POLL_S = 0.4        # how often to ask the recorder what it is doing
 DRAIN_INTERVAL_S = 0.02    # how often to empty the board's USB buffers
 STATUS_REFRESH_S = 15.0    # how often to re-read the board config while idle
+WATCHDOG_TIMEOUT_S = 30.0  # main loop silence after which the process aborts
+DRAIN_ERROR_LIMIT = 50     # consecutive read failures before giving up on a session
 CONTROL_COMPONENTS = {"log_controller", "tags_info", "acquisition_info",
                       "firmware_info", "DeviceInformation", "automode"}
 
@@ -89,6 +92,44 @@ class ServerWatcher(threading.Thread):
             self._stop.wait(STATUS_POLL_S)
 
 
+class Watchdog(threading.Thread):
+    """Aborts the process if the main loop stops making progress.
+
+    Calls into the board's library can block forever -- a board wedged by an
+    earlier crash makes hs_datalog_open() never return -- and that happens
+    inside C code holding the GIL, so nothing in Python can interrupt it.
+    Exiting loudly is the only useful response: systemd restarts us, and the log
+    says plainly that the board needs its RESET button.
+    """
+
+    def __init__(self, timeout: float = WATCHDOG_TIMEOUT_S):
+        super().__init__(name="watchdog", daemon=True)
+        self.timeout = timeout
+        self._beat = time.monotonic()
+        self._armed = threading.Event()
+        self._stop = threading.Event()
+
+    def beat(self) -> None:
+        self._beat = time.monotonic()
+        self._armed.set()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def run(self) -> None:
+        while not self._stop.wait(2.0):
+            if not self._armed.is_set():
+                continue
+            silent = time.monotonic() - self._beat
+            if silent > self.timeout:
+                logger.critical(
+                    "board unresponsive: no progress for %.0fs. The STWIN needs "
+                    "its RESET button pressed; aborting so systemd can retry.",
+                    silent)
+                sys.stderr.flush()
+                os._exit(70)        # bypass the hung C call; no cleanup possible
+
+
 class SensorDaemon:
     def __init__(self, base_url: str, lib_path: str = "", fallback_dir: str = "",
                  wav_components=WAV_COMPONENTS):
@@ -108,6 +149,8 @@ class SensorDaemon:
         # second behind it.
         self._cached_status: dict | None = None
         self._cached_at = 0.0
+        self.watchdog = Watchdog()
+        self._read_errors = 0
 
     # -- board sessions ---------------------------------------------------
 
@@ -131,6 +174,10 @@ class SensorDaemon:
         if not components:
             raise StwinError("board reports no enabled sensors")
 
+        # Anything the board buffered before this session would land in the new
+        # files and, worse, break block alignment for the loss detector.
+        self._discard_pending(components)
+
         os.makedirs(directory, exist_ok=True)
         self.streams = {n: ComponentStream(n, cfg) for n, cfg in components.items()}
         self.started_unix = time.time()
@@ -152,6 +199,21 @@ class SensorDaemon:
             }, fh, indent=2)
         logger.info("sensor logging started: %s (%d components)",
                     directory, len(self.streams))
+
+    def _discard_pending(self, components: dict) -> None:
+        """Throw away data left over from an earlier session."""
+        dropped = 0
+        for name in components:
+            try:
+                for _ in range(50):
+                    size = self.board.available(name)
+                    if size <= 0:
+                        break
+                    dropped += len(self.board.read(name, size))
+            except StwinError:
+                logger.debug("could not flush %s before starting", name)
+        if dropped:
+            logger.info("discarded %d stale bytes before starting", dropped)
 
     def _end(self) -> None:
         if not self.logging_active:
@@ -183,7 +245,11 @@ class SensorDaemon:
         """Move whatever the board has buffered into the CSV files."""
         rounds = 20 if final else 1
         for _ in range(rounds):
+            # Finalising a session can take a while; keep the watchdog informed
+            # so it never aborts the process midway through closing files.
+            self.watchdog.beat()
             moved = 0
+            failures = 0
             for name, stream in self.streams.items():
                 try:
                     size = self.board.available(name)
@@ -191,11 +257,23 @@ class SensorDaemon:
                         continue
                     raw = self.board.read(name, size)
                 except StwinError:
-                    logger.exception("read failed for %s", name)
+                    # Log once per burst rather than at loop rate, which would
+                    # bury everything else if the board goes away mid-recording.
+                    failures += 1
+                    self._read_errors += 1
+                    if self._read_errors in (1, DRAIN_ERROR_LIMIT):
+                        logger.exception("read failed for %s", name)
                     continue
                 moved += len(raw)
                 values, times = stream.feed(raw)
                 self.writers[name].write(values, times)
+            if failures == 0:
+                self._read_errors = 0
+            elif self._read_errors >= DRAIN_ERROR_LIMIT and not final:
+                logger.error("giving up on this sensor session after %d read errors",
+                             self._read_errors)
+                self._end()
+                return
             if final and moved == 0:
                 break
 
@@ -205,6 +283,8 @@ class SensorDaemon:
         self._stop.set()
 
     def run(self) -> int:
+        self.watchdog.start()
+        self.watchdog.beat()
         self.board.open()
         # A previous run that died mid-log leaves the board streaming; clearing
         # it here is harmless when it was already idle.
@@ -220,6 +300,7 @@ class SensorDaemon:
 
         try:
             while not self._stop.is_set():
+                self.watchdog.beat()
                 recording, directory, name, reachable = self.watcher.snapshot()
                 target = directory or (
                     os.path.join(self.fallback_dir, name) if name and self.fallback_dir else "")
@@ -245,6 +326,7 @@ class SensorDaemon:
             try:
                 self._end()
             finally:
+                self.watchdog.stop()
                 self.watcher.stop()
                 self.board.close()
                 logger.info("sensor daemon stopped")

@@ -79,6 +79,7 @@ class ComponentWriter:
             # enough and the board's buffer wrapped; samples are missing.
             "lost_bytes": self.stream.lost_bytes,
             "bad_timestamps": self.stream.bad_timestamps,
+            "resyncs": self.stream.resyncs,
             "transport_block_payload": self.stream.block_payload,
             "size_bytes": os.path.getsize(self.path) if os.path.exists(self.path) else 0,
         }
@@ -144,6 +145,7 @@ class WavWriter:
             "data_type": self.stream.data_type,
             "lost_bytes": self.stream.lost_bytes,
             "bad_timestamps": self.stream.bad_timestamps,
+            "resyncs": self.stream.resyncs,
             "transport_block_payload": self.stream.block_payload,
             "size_bytes": os.path.getsize(self.path) if os.path.exists(self.path) else 0,
         }
