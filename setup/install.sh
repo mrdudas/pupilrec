@@ -81,6 +81,7 @@ sudo visudo -c -f /etc/sudoers.d/pupilrec
 echo "==> udev rules"
 sudo install -m 0644 "${ROOT}/setup/70-pupil-cams.rules" /etc/udev/rules.d/
 sudo install -m 0644 "${ROOT}/setup/71-stwin-datalog.rules" /etc/udev/rules.d/
+sudo install -m 0644 "${ROOT}/setup/72-ublox-gps.rules" /etc/udev/rules.d/
 sudo udevadm control --reload-rules
 sudo udevadm trigger --subsystem-match=usb --action=add
 sleep 2

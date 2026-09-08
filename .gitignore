@@ -8,3 +8,5 @@ config.json
 vendor/
 # Runtime state published by the sensor daemon.
 var/
+# Continuous GNSS logs.
+gps/

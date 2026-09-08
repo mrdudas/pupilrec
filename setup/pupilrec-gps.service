@@ -1,0 +1,21 @@
+# Continuous GNSS logging.  Independent of recordings and of the receiver being
+# attached: with no receiver it waits quietly, so this unit is safe to enable
+# even when the GPS is not part of the setup.
+[Unit]
+Description=GNSS logger (continuous, copies into recordings)
+After=network-online.target
+
+[Service]
+Type=simple
+User=zsolt
+# plugdev carries the serial port access granted by 72-ublox-gps.rules.
+SupplementaryGroups=plugdev
+WorkingDirectory=/home/zsolt/aimotive
+ExecStart=/home/zsolt/aimotive/.venv/bin/python /home/zsolt/aimotive/run_gps.py
+Restart=always
+RestartSec=10
+StartLimitIntervalSec=600
+StartLimitBurst=10
+
+[Install]
+WantedBy=multi-user.target

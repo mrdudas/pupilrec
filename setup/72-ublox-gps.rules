@@ -1,0 +1,3 @@
+# u-blox GNSS receiver.  Same access model as the cameras and the sensor board:
+# plugdev for services started at boot, uaccess for a local desktop session.
+SUBSYSTEM=="tty", ATTRS{idVendor}=="1546", MODE="0660", GROUP="plugdev", TAG+="uaccess"

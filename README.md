@@ -112,6 +112,33 @@ one file each. The two microphones go to WAV plus a timestamp table, because CSV
 at 192 kHz demonstrably loses samples. Details, the stream format and the
 measured rates are in [docs/STWIN-SENSORS.md](docs/STWIN-SENSORS.md).
 
+## GNSS logging
+
+A u-blox receiver on USB is logged **continuously**, whether or not anything is
+being recorded, to `gps/<date>_gps.log.csv` -- one file per day, appended across
+unplugs. While a recording runs, the same rows are also written into the
+recording's directory, so a recording carries its own copy of the track.
+
+```sh
+./run_gps.py --probe    # what the receiver is doing right now
+sudo cp setup/pupilrec-gps.service /etc/systemd/system/
+sudo systemctl enable --now pupilrec-gps
+```
+
+Rate is **10 Hz with GPS, GLONASS, Galileo and BeiDou**. The receiver can reach
+18 Hz, but only with GPS alone -- `--gps-only` selects that if the extra rate is
+worth losing three constellations, which for fix quality it usually is not. It
+clamps anything below a 55 ms period to 100 ms.
+
+Rows are written even with no fix: indoors the receiver reports `fix=none` with
+no position, and logging that documents the gap rather than leaving a silent
+hole. Position columns fill in only once the receiver reports a valid fix.
+
+**The receiver is optional.** With none attached the logger waits quietly and
+nothing else is affected; unplugging it mid-run is not an error and it is picked
+back up automatically, typically within five seconds. Recordings made without it
+simply contain no GPS file.
+
 ## When something wedges
 
 The UI has a **Rendszer állapota** panel showing whether the cameras stream, the
@@ -124,6 +151,7 @@ buttons. It refuses to restart anything mid-recording without a confirmation.
 | a camera drops its stream | the worker reopens it -- automatic |
 | the board stops responding | **Board tápciklizálása** power-cycles its USB port and restarts the daemon with it |
 | the recorder itself | **Kameraszerver újraindítása** |
+| the GNSS receiver is unplugged | logged as absent, picked up again on its own |
 
 The board's power cycle brought it back every time it was tried here, but it is
 not guaranteed: if the board still does not answer, its physical RESET button is
@@ -162,7 +190,8 @@ recordings/2026-09-08_19-55-29_teszt/
 ├── stwin_imp34dt05_mic.wav      digital microphone, 48 kHz
 ├── stwin_imp34dt05_mic_timestamps.csv
 ├── stwin_board.json  every sensor's configuration as the board reported it
-└── stwin_recording.json  per-sensor row counts, lost bytes, timing
+├── stwin_recording.json  per-sensor row counts, lost bytes, timing
+└── <date>_gps.log.csv    the GNSS track for this recording, if a receiver was attached
 ```
 
 Every sensor CSV carries `sample_index, unix_time, device_time` and one column

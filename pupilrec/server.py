@@ -325,6 +325,7 @@ class Handler(BaseHTTPRequestHandler):
             return "unknown"
 
     def _health(self) -> dict:
+        from gpslog.daemon import HEARTBEAT_PATH as GPS_HEARTBEAT
         from sensorlog.heartbeat import read as read_heartbeat
 
         cameras = self.state.status()["cameras"]
@@ -335,9 +336,12 @@ class Handler(BaseHTTPRequestHandler):
                 "streaming": all(c["connected"] for c in cameras) and bool(cameras),
             },
             "sensors": read_heartbeat(),
+            # The GNSS receiver is optional equipment; absent is a normal state.
+            "gps": read_heartbeat(GPS_HEARTBEAT),
             "services": {
                 "pupilrec": self._service_state("pupilrec.service"),
                 "pupilrec-sensors": self._service_state("pupilrec-sensors.service"),
+                "pupilrec-gps": self._service_state("pupilrec-gps.service"),
             },
             "recovery_available": os.access(RECOVER_HELPER, os.X_OK),
             "recording": self.state.status()["recording"],

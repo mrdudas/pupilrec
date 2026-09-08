@@ -97,6 +97,7 @@
   .chip .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
   .chip.ok .dot { background: var(--ok); }
   .chip.bad .dot { background: var(--rec); }
+  .chip.idle { color: var(--muted); }
   .chip.bad { border-color: var(--rec); }
   .actions { display: flex; flex-wrap: wrap; gap: 10px; }
   button.ghost { background: var(--panel-2); border: 1px solid var(--line); font-weight: 500; padding: 11px 16px; }
@@ -401,8 +402,10 @@ async function releaseWakeLock() {
   wakeLock = null;
 }
 
-function chip(ok, label) {
-  return `<span class="chip ${ok ? "ok" : "bad"}"><span class="dot"></span>${label}</span>`;
+function chip(state, label) {
+  // true = good, false = a problem, "idle" = present but nothing to report
+  const cls = state === "idle" ? "idle" : state ? "ok" : "bad";
+  return `<span class="chip ${cls}"><span class="dot"></span>${label}</span>`;
 }
 
 async function loadHealth() {
@@ -425,8 +428,18 @@ async function loadHealth() {
   if (s.last_error) chips.push(chip(false, s.last_error.slice(0, 60)));
   const lost = Object.values(s.lost_bytes || {}).reduce((a, b) => a + b, 0);
   if (lost > 0) chips.push(chip(false, `${lost} bájt szenzoradat elveszett`));
+  // The GNSS receiver is optional, so "not attached" is neutral, not an alarm.
+  const g = h.gps || {};
+  if (!g.running || !g.connected) {
+    chips.push(chip("idle", "GPS nincs csatlakoztatva"));
+  } else {
+    const fix = g.fix_ok ? `fix: ${g.fix}, ${g.num_sv} műhold` : `nincs fix (${g.num_sv} műhold)`;
+    chips.push(chip(g.fix_ok ? true : "idle", `GPS ${g.rate_hz} Hz — ${fix}`));
+    if (g.copy_rows) chips.push(chip(true, `GPS rögzítés a felvételbe (${g.copy_rows} sor)`));
+  }
+
   for (const [unit, state] of Object.entries(h.services || {}))
-    if (state !== "active") chips.push(chip(false, `${unit}: ${state}`));
+    if (state !== "active" && state !== "inactive") chips.push(chip(false, `${unit}: ${state}`));
 
   document.getElementById("healthChips").innerHTML = chips.join("");
   document.querySelectorAll("[data-restart]").forEach(b => { b.disabled = !h.recovery_available; });
