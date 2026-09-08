@@ -44,7 +44,16 @@ driver cannot run these four cameras at all, and which two traps the stack has.
 
 It prints the URL to open on the iPad, e.g. `http://192.168.7.50:8080/`.
 
-To have it come back after a reboot, see `setup/pupilrec.service`.
+To have it come back after a reboot:
+
+```sh
+sudo cp setup/pupilrec.service /etc/systemd/system/
+sudo systemctl enable --now pupilrec
+```
+
+The unit runs as `zsolt` with the `plugdev` group, which is what grants raw USB
+access when nobody is logged in graphically -- the `uaccess` tag in the udev
+rules only covers a local desktop session.
 
 ## Using it
 

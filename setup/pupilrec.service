@@ -1,20 +1,27 @@
-# Optional: run the recorder as a service so the iPad can reach it after a
-# reboot without anyone logging in.
+# Run the recorder as a service so the iPad can reach it after a reboot
+# without anyone logging in.
 #   sudo cp setup/pupilrec.service /etc/systemd/system/
 #   sudo systemctl enable --now pupilrec
 [Unit]
 Description=Pupil Core recording front-end
 After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
 User=zsolt
-# plugdev carries the raw USB access granted by 70-pupil-cams.rules.
+# plugdev carries the raw USB access granted by 70-pupil-cams.rules.  The
+# uaccess tag in that file only covers a local desktop login, which a service
+# started at boot does not have -- hence the group.
 SupplementaryGroups=plugdev
 WorkingDirectory=/home/zsolt/aimotive
 ExecStart=/home/zsolt/aimotive/.venv/bin/python /home/zsolt/aimotive/run.py
+# run.py exits non-zero when it finds no cameras, so at boot this keeps retrying
+# while USB enumeration finishes instead of giving up after the default 5 tries.
 Restart=on-failure
 RestartSec=5
+StartLimitIntervalSec=120
+StartLimitBurst=12
 
 [Install]
 WantedBy=multi-user.target

@@ -63,7 +63,7 @@ PKG_CONFIG_PATH=/usr/local/lib/pkgconfig ./.venv/bin/pip install "${BUILD}/pyuvc
 echo "==> udev rules"
 sudo install -m 0644 "${ROOT}/setup/70-pupil-cams.rules" /etc/udev/rules.d/
 sudo udevadm control --reload-rules
-sudo udevadm trigger --subsystem-match=usb
+sudo udevadm trigger --subsystem-match=usb --action=add
 sleep 2
 
 echo
