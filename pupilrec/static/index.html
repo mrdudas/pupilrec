@@ -87,6 +87,20 @@
   }
   #offline small { color: #d3a9ab; }
   .stale { opacity: .35; filter: grayscale(1); transition: opacity .3s; }
+  #system { padding: 0 18px 8px; }
+  #system h2, #recordings h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .09em; color: var(--muted); }
+  .chips { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
+  .chip {
+    display: inline-flex; align-items: center; gap: 7px; padding: 6px 12px;
+    border-radius: 999px; background: var(--panel); border: 1px solid var(--line); font-size: 13px;
+  }
+  .chip .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+  .chip.ok .dot { background: var(--ok); }
+  .chip.bad .dot { background: var(--rec); }
+  .chip.bad { border-color: var(--rec); }
+  .actions { display: flex; flex-wrap: wrap; gap: 10px; }
+  button.ghost { background: var(--panel-2); border: 1px solid var(--line); font-weight: 500; padding: 11px 16px; }
+  .hint { color: var(--muted); font-size: 12.5px; margin: 12px 0 0; max-width: 60ch; }
   #toast {
     position: fixed; left: 50%; bottom: 26px; transform: translateX(-50%);
     background: var(--panel-2); border: 1px solid var(--line); border-radius: 10px;
@@ -120,6 +134,18 @@
 </div>
 
 <main id="grid"></main>
+
+<section id="system">
+  <h2>Rendszer állapota</h2>
+  <div class="chips" id="healthChips"></div>
+  <div class="actions">
+    <button class="ghost" data-restart="sensors">Szenzor daemon újraindítása</button>
+    <button class="ghost" data-restart="board">Board tápciklizálása</button>
+    <button class="ghost" data-restart="server">Kameraszerver újraindítása</button>
+  </div>
+  <p class="hint">Ha a board a tápciklizálás után sem tér magához, a rajta lévő
+     RESET gombot kell megnyomni — azt szoftverből nem lehet kiváltani.</p>
+</section>
 
 <section id="recordings">
   <h2>Korábbi felvételek</h2>
@@ -297,6 +323,7 @@ function goOnline() {
     // The preview sockets died with the connection; rebuild them all.
     reattachAll();
     loadRecordings();
+    loadHealth();
   }
 }
 
@@ -374,6 +401,66 @@ async function releaseWakeLock() {
   wakeLock = null;
 }
 
+function chip(ok, label) {
+  return `<span class="chip ${ok ? "ok" : "bad"}"><span class="dot"></span>${label}</span>`;
+}
+
+async function loadHealth() {
+  let h;
+  try {
+    h = await (await fetch("/api/health", { cache: "no-store" })).json();
+  } catch { return; }
+
+  const s = h.sensors || {};
+  const chips = [
+    chip(h.cameras.streaming, `kamerák ${h.cameras.connected}/${h.cameras.total}`),
+    chip(s.running, s.running ? "szenzor daemon fut" : (s.reason || "szenzor daemon áll")),
+    chip(s.running && s.board_connected, s.board_connected ? "board csatlakozik" : "board nem elérhető"),
+  ];
+  if (h.recording && !(s.running && s.logging))
+    // The dangerous state: video is being recorded while sensors are not.
+    chips.push(chip(false, "FIGYELEM: felvétel megy, de szenzoradat NEM készül"));
+  else if (s.running && s.logging)
+    chips.push(chip(true, `szenzorok rögzítenek (${s.components.length} db)`));
+  if (s.last_error) chips.push(chip(false, s.last_error.slice(0, 60)));
+  const lost = Object.values(s.lost_bytes || {}).reduce((a, b) => a + b, 0);
+  if (lost > 0) chips.push(chip(false, `${lost} bájt szenzoradat elveszett`));
+  for (const [unit, state] of Object.entries(h.services || {}))
+    if (state !== "active") chips.push(chip(false, `${unit}: ${state}`));
+
+  document.getElementById("healthChips").innerHTML = chips.join("");
+  document.querySelectorAll("[data-restart]").forEach(b => { b.disabled = !h.recovery_available; });
+}
+
+async function restart(target, force) {
+  const res = await fetch("/api/restart", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ target, force: !!force }),
+  });
+  const body = await res.json();
+  if (res.status === 409 && body.needs_force) {
+    if (confirm(body.error + "\n\nBiztosan újraindítod, elveszítve a felvételt?"))
+      return restart(target, true);
+    return;
+  }
+  if (!res.ok) throw new Error(body.error || "sikertelen");
+  toast(`${body.what}: újraindítva`, "info");
+}
+
+document.querySelectorAll("[data-restart]").forEach(btn => {
+  btn.onclick = async () => {
+    const target = btn.dataset.restart;
+    btn.disabled = true;
+    try {
+      await restart(target, false);
+    } catch (e) {
+      toast(e.message, "error");
+    }
+    // The service needs a moment; recheck rather than leaving a stale chip.
+    setTimeout(() => { loadHealth(); btn.disabled = false; }, 4000);
+  };
+});
+
 async function loadRecordings() {
   try {
     const { recordings } = await (await fetch("/api/recordings", { cache: "no-store" })).json();
@@ -442,7 +529,9 @@ window.addEventListener("offline", goOffline);
 
 refresh();
 loadRecordings();
+loadHealth();
 setInterval(refresh, POLL_MS);
+setInterval(loadHealth, 3000);
 setInterval(() => { if (!online && offlineSince) goOffline(); }, 1000);
 </script>
 </body>

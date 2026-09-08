@@ -1,0 +1,77 @@
+#!/usr/bin/env python3
+"""Privileged recovery actions, callable from the web UI through sudo.
+
+Deliberately tiny and with a fixed set of actions: the sudoers rule grants
+password-less root to exactly this script, so it must not take arbitrary input.
+
+  pupilrec-recover sensors   restart the sensor daemon
+  pupilrec-recover server    restart the camera recorder
+  pupilrec-recover board     power-cycle the STWIN board's USB port
+"""
+
+import glob
+import os
+import subprocess
+import sys
+
+STWIN_VID, STWIN_PID = "0483", "5744"
+ACTIONS = ("sensors", "server", "board")
+
+
+def usb_port_of_board():
+    """-> (hub, port) for the STWIN, e.g. ("3-5", "3"). None if not attached."""
+    for path in glob.glob("/sys/bus/usb/devices/*"):
+        try:
+            with open(os.path.join(path, "idVendor")) as fh:
+                vid = fh.read().strip()
+            with open(os.path.join(path, "idProduct")) as fh:
+                pid = fh.read().strip()
+        except OSError:
+            continue
+        if (vid, pid) != (STWIN_VID, STWIN_PID):
+            continue
+        name = os.path.basename(path)          # e.g. "3-5.3"
+        if "." not in name:
+            return None
+        hub, _, port = name.rpartition(".")
+        return hub, port
+    return None
+
+
+def main():
+    if len(sys.argv) != 2 or sys.argv[1] not in ACTIONS:
+        print(f"usage: {os.path.basename(sys.argv[0])} {{{'|'.join(ACTIONS)}}}",
+              file=sys.stderr)
+        return 2
+    action = sys.argv[1]
+
+    if action == "sensors":
+        # --no-block so the caller is not held while the daemon stops cleanly.
+        return subprocess.call(["systemctl", "restart", "--no-block",
+                                "pupilrec-sensors.service"])
+    if action == "server":
+        # This kills the process making the request, hence --no-block: the HTTP
+        # response goes out before systemd tears the service down.
+        return subprocess.call(["systemctl", "restart", "--no-block",
+                                "pupilrec.service"])
+
+    where = usb_port_of_board()
+    if where is None:
+        print("STWIN board not found on any USB port", file=sys.stderr)
+        return 1
+    hub, port = where
+    print(f"power-cycling {hub} port {port}", flush=True)
+    rc = subprocess.call(["uhubctl", "-l", hub, "-p", port, "-a", "cycle", "-d", "5"])
+    if rc != 0:
+        return rc
+    # The daemon is holding a handle to a device that just vanished, so it has
+    # to come back with the board.  Without this the board is healthy while
+    # nothing records -- the worst of both states.
+    print("power cycled; restarting the sensor daemon to pick the board back up")
+    subprocess.call(["systemctl", "restart", "--no-block", "pupilrec-sensors.service"])
+    print("if the board still does not respond, press its physical RESET button")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

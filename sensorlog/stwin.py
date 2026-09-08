@@ -106,6 +106,10 @@ class Stwin:
             )
         logger.info("STWIN connected (%s, %d device(s))", self.version(), count.value)
 
+    @property
+    def is_open(self) -> bool:
+        return self._open
+
     def close(self) -> None:
         if self._open:
             self._lib.hs_datalog_close()

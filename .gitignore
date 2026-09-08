@@ -6,3 +6,5 @@ recordings/
 config.json
 # ST's prebuilt library; setup/install.sh fetches it.
 vendor/
+# Runtime state published by the sensor daemon.
+var/

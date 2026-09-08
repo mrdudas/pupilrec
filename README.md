@@ -112,6 +112,27 @@ one file each. The two microphones go to WAV plus a timestamp table, because CSV
 at 192 kHz demonstrably loses samples. Details, the stream format and the
 measured rates are in [docs/STWIN-SENSORS.md](docs/STWIN-SENSORS.md).
 
+## When something wedges
+
+The UI has a **Rendszer állapota** panel showing whether the cameras stream, the
+sensor daemon runs, and the board actually answers -- plus three recovery
+buttons. It refuses to restart anything mid-recording without a confirmation.
+
+| what wedges | what happens |
+|---|---|
+| sensor daemon hangs | its watchdog aborts it, systemd restarts it -- automatic |
+| a camera drops its stream | the worker reopens it -- automatic |
+| the board stops responding | **Board tápciklizálása** power-cycles its USB port and restarts the daemon with it |
+| the recorder itself | **Kameraszerver újraindítása** |
+
+The board's power cycle brought it back every time it was tried here, but it is
+not guaranteed: if the board still does not answer, its physical RESET button is
+the only remaining option. The panel says so rather than pretending otherwise.
+
+The panel is deliberate about one state: if a recording is running while sensors
+are **not** being captured, it says so in red. A green light over a recording
+that is quietly missing half its data is the failure worth designing against.
+
 **Never `kill -9` the sensor daemon**: a process killed while the board streams
 wedges the board until someone presses its RESET button.
 

@@ -14,7 +14,7 @@ sudo apt-get update -qq
 sudo apt-get install -y \
     git cmake pkg-config build-essential \
     libusb-1.0-0-dev libturbojpeg0-dev \
-    ffmpeg python3-venv python3-pip usbutils v4l-utils
+    ffmpeg python3-venv python3-pip usbutils v4l-utils uhubctl
 
 # libuvc: Pupil Labs' fork.  Unlike the kernel's uvcvideo it lets the caller ask
 # for a smaller isochronous payload, which is the only way to run both cameras
@@ -70,6 +70,13 @@ fi
 mkdir -p "${ROOT}/vendor"
 cp "${BUILD}/datalog1/Utilities/HSDPython_SDK/st_hsdatalog/st_hsdatalog/HSD_link/communication/libhs_datalog/linux/libhs_datalog_v2.so" \
    "${ROOT}/vendor/"
+
+# Lets the web UI restart the services and power-cycle the board.  The sudoers
+# rule grants password-less root for exactly these three actions, nothing else.
+echo "==> recovery helper"
+sudo install -m 0755 "${ROOT}/setup/pupilrec-recover" /usr/local/sbin/
+sudo install -m 0440 "${ROOT}/setup/pupilrec-sudoers" /etc/sudoers.d/pupilrec
+sudo visudo -c -f /etc/sudoers.d/pupilrec
 
 echo "==> udev rules"
 sudo install -m 0644 "${ROOT}/setup/70-pupil-cams.rules" /etc/udev/rules.d/

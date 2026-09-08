@@ -20,6 +20,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from socketserver import ThreadingMixIn
 from urllib.parse import parse_qs, urlparse
 
+import shutil
+import subprocess
+
 from .recording import RecordingSession
 
 logger = logging.getLogger(__name__)
@@ -27,6 +30,15 @@ logger = logging.getLogger(__name__)
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 BOUNDARY = "pupilframe"
 STREAM_WRITE_TIMEOUT = 20.0     # seconds before a stalled preview client is dropped
+
+# Privileged recovery actions, run through a sudoers rule that allows exactly
+# these three arguments and nothing else (setup/pupilrec-sudoers).
+RECOVER_HELPER = "/usr/local/sbin/pupilrec-recover"
+RECOVER_TARGETS = {
+    "sensors": "sensor daemon",
+    "server": "camera recorder",
+    "board": "sensor board USB power",
+}
 
 
 class AlreadyRecording(Exception):
@@ -201,6 +213,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_bytes(fh.read(), "text/html; charset=utf-8")
         if path == "/api/status":
             return self._send_json(self.state.status())
+        if path == "/api/health":
+            return self._send_json(self._health())
         if path == "/api/recordings":
             return self._send_json({"recordings": self._list_recordings()})
         if path.startswith("/snapshot/"):
@@ -225,6 +239,8 @@ class Handler(BaseHTTPRequestHandler):
                     self.state.start_recording(payload.get("name", ""), client))
             if url.path == "/api/stop":
                 return self._send_json(self.state.stop_recording(client))
+            if url.path == "/api/restart":
+                return self._restart(payload)
         except AlreadyRecording as exc:
             # Two clients pressed start at once.  The loser is not in error --
             # it just needs to know a recording is running and who owns it.
@@ -299,6 +315,66 @@ class Handler(BaseHTTPRequestHandler):
                     self.wfile.write(b"\r\n")
         except (BrokenPipeError, ConnectionResetError, TimeoutError, OSError):
             pass                                    # viewer navigated away
+
+    def _service_state(self, unit: str) -> str:
+        try:
+            out = subprocess.run(["systemctl", "is-active", unit],
+                                 capture_output=True, text=True, timeout=5)
+            return out.stdout.strip() or "unknown"
+        except (OSError, subprocess.SubprocessError):
+            return "unknown"
+
+    def _health(self) -> dict:
+        from sensorlog.heartbeat import read as read_heartbeat
+
+        cameras = self.state.status()["cameras"]
+        return {
+            "cameras": {
+                "connected": sum(1 for c in cameras if c["connected"]),
+                "total": len(cameras),
+                "streaming": all(c["connected"] for c in cameras) and bool(cameras),
+            },
+            "sensors": read_heartbeat(),
+            "services": {
+                "pupilrec": self._service_state("pupilrec.service"),
+                "pupilrec-sensors": self._service_state("pupilrec-sensors.service"),
+            },
+            "recovery_available": os.access(RECOVER_HELPER, os.X_OK),
+            "recording": self.state.status()["recording"],
+        }
+
+    def _restart(self, payload) -> None:
+        target = str(payload.get("target", ""))
+        if target not in RECOVER_TARGETS:
+            return self._error("Unknown restart target")
+        if not os.access(RECOVER_HELPER, os.X_OK):
+            return self._error("Recovery helper is not installed; see setup/install.sh",
+                               HTTPStatus.NOT_IMPLEMENTED)
+        with self.state.lock:
+            recording = self.state.session is not None
+        if recording and not payload.get("force"):
+            # Restarting mid-recording throws away what has been captured, so
+            # it takes a deliberate second press rather than one stray tap.
+            return self._send_json(
+                {"error": "A recording is running. Stop it first, or confirm to "
+                          "restart anyway and lose it.",
+                 "needs_force": True}, HTTPStatus.CONFLICT)
+        try:
+            done = subprocess.run(["sudo", "-n", RECOVER_HELPER, target],
+                                  capture_output=True, text=True, timeout=60)
+        except (OSError, subprocess.SubprocessError) as exc:
+            return self._error(f"Could not run recovery: {exc}",
+                               HTTPStatus.INTERNAL_SERVER_ERROR)
+        if done.returncode != 0:
+            return self._error(
+                (done.stderr or done.stdout or "recovery failed").strip()[:300],
+                HTTPStatus.INTERNAL_SERVER_ERROR)
+        logger.warning("recovery action %r requested from %s", target, self.address_string())
+        return self._send_json({
+            "target": target,
+            "what": RECOVER_TARGETS[target],
+            "output": (done.stdout or "").strip()[:500],
+        })
 
     def _list_recordings(self):
         root = self.state.cfg.recordings_dir

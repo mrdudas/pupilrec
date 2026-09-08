@@ -22,6 +22,7 @@ import urllib.error
 import urllib.request
 from datetime import datetime
 
+from .heartbeat import Heartbeat
 from .parser import ComponentStream
 from .stwin import INTERFACE_USB, Stwin, StwinError
 from .writer import WAV_COMPONENTS, make_writer
@@ -31,8 +32,10 @@ logger = logging.getLogger(__name__)
 STATUS_POLL_S = 0.4        # how often to ask the recorder what it is doing
 DRAIN_INTERVAL_S = 0.02    # how often to empty the board's USB buffers
 STATUS_REFRESH_S = 15.0    # how often to re-read the board config while idle
+HEARTBEAT_S = 1.0          # how often to publish state for the web UI
 WATCHDOG_TIMEOUT_S = 30.0  # main loop silence after which the process aborts
 DRAIN_ERROR_LIMIT = 50     # consecutive read failures before giving up on a session
+RECONNECT_DELAY_S = 3.0    # pause before reopening a board that went away
 CONTROL_COMPONENTS = {"log_controller", "tags_info", "acquisition_info",
                       "firmware_info", "DeviceInformation", "automode"}
 
@@ -151,6 +154,13 @@ class SensorDaemon:
         self._cached_at = 0.0
         self.watchdog = Watchdog()
         self._read_errors = 0
+        self._status_errors = 0
+        # Published for the web UI, which otherwise has no way to tell whether
+        # sensors are being recorded at all.
+        self.heartbeat = Heartbeat()
+        self._last_beat = 0.0
+        self.last_error = ""
+        self.last_result: dict | None = None
 
     # -- board sessions ---------------------------------------------------
 
@@ -158,8 +168,15 @@ class SensorDaemon:
         try:
             self._cached_status = self.board.device_status()
             self._cached_at = time.monotonic()
-        except StwinError:
-            logger.exception("could not read board status")
+            self._status_errors = 0
+        except StwinError as exc:
+            self._status_errors += 1
+            self.last_error = str(exc)
+            if self._status_errors == 1:
+                logger.exception("could not read board status")
+            if self._status_errors >= 3:
+                self._reconnect_board()
+                self._status_errors = 0
 
     def _begin(self, directory: str, name: str) -> None:
         # The control channel does not answer while the board streams, so the
@@ -200,6 +217,60 @@ class SensorDaemon:
         logger.info("sensor logging started: %s (%d components)",
                     directory, len(self.streams))
 
+    def _reconnect_board(self) -> None:
+        """Reopen the board after it disappeared, e.g. a replug or power cycle.
+
+        Without this the daemon keeps a handle to a device that is gone and the
+        library logs a control-transfer failure for every read attempt, which
+        floods the journal and records nothing.
+        """
+        logger.warning("board stopped responding; reconnecting")
+        if self.logging_active:
+            self.logging_active = False
+            try:
+                for writer in self.writers.values():
+                    writer.close()
+            except Exception:
+                logger.exception("could not close writers")
+            self.writers, self.streams, self.session_dir = {}, {}, ""
+        try:
+            self.board.close()
+        except Exception:
+            logger.exception("closing the board failed")
+        self._cached_status, self._cached_at = None, 0.0
+        self._read_errors = 0
+        self._stop.wait(RECONNECT_DELAY_S)
+        try:
+            self.board.open()
+            try:
+                self.board.stop_log()
+            except StwinError:
+                pass
+            self.last_error = ""
+            logger.info("board reconnected")
+        except StwinError as exc:
+            self.last_error = f"board unavailable: {exc}"
+            logger.error("reconnect failed: %s", exc)
+
+    def _publish(self, server_reachable: bool) -> None:
+        self.heartbeat.write({
+            "pid": os.getpid(),
+            # Whether the board actually answered recently, not merely whether a
+            # handle is open: a handle to a device that has been unplugged stays
+            # "open" and would show a green light while nothing is recorded.
+            "board_connected": self.board.is_open and self._status_errors == 0
+                               and self._cached_status is not None,
+            "logging": self.logging_active,
+            "recording_dir": self.session_dir,
+            "components": sorted(self.streams),
+            "rows": {n: w.rows for n, w in self.writers.items()},
+            "lost_bytes": {n: s.lost_bytes for n, s in self.streams.items()},
+            "read_errors": self._read_errors,
+            "server_reachable": server_reachable,
+            "last_error": self.last_error,
+            "last_result": self.last_result,
+        })
+
     def _discard_pending(self, components: dict) -> None:
         """Throw away data left over from an earlier session."""
         dropped = 0
@@ -236,6 +307,13 @@ class SensorDaemon:
                 "duration_s": round(stopped - self.started_unix, 3),
                 "components": results,
             }, fh, indent=2)
+        self.last_result = {
+            "directory": os.path.basename(self.session_dir),
+            "duration_s": round(stopped - self.started_unix, 3),
+            "rows": sum(r["rows"] for r in results),
+            "lost_bytes": sum(r["lost_bytes"] for r in results),
+            "components": len(results),
+        }
         total = sum(r["rows"] for r in results)
         logger.info("sensor logging stopped: %d rows across %d files",
                     total, len(results))
@@ -272,7 +350,7 @@ class SensorDaemon:
             elif self._read_errors >= DRAIN_ERROR_LIMIT and not final:
                 logger.error("giving up on this sensor session after %d read errors",
                              self._read_errors)
-                self._end()
+                self._reconnect_board()
                 return
             if final and moved == 0:
                 break
@@ -302,14 +380,20 @@ class SensorDaemon:
             while not self._stop.is_set():
                 self.watchdog.beat()
                 recording, directory, name, reachable = self.watcher.snapshot()
+                if time.monotonic() - self._last_beat >= HEARTBEAT_S:
+                    self._publish(reachable)
+                    self._last_beat = time.monotonic()
                 target = directory or (
                     os.path.join(self.fallback_dir, name) if name and self.fallback_dir else "")
 
                 if recording and not self.logging_active and target:
                     try:
                         self._begin(target, name)
-                    except StwinError:
+                        self.last_error = ""
+                    except StwinError as exc:
                         logger.exception("could not start sensor logging")
+                        self.last_error = str(exc)
+                        self._publish(reachable)
                         self._stop.wait(2.0)
                 elif not recording and self.logging_active:
                     self._end()
@@ -329,6 +413,7 @@ class SensorDaemon:
                 self.watchdog.stop()
                 self.watcher.stop()
                 self.board.close()
+                self.heartbeat.clear()
                 logger.info("sensor daemon stopped")
         return 0
 
