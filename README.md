@@ -69,6 +69,30 @@ The preview is throttled (10 fps by default, selectable in the header) so that
 Wi-Fi never limits what gets recorded. **Recording always stores every captured
 frame** regardless of what the preview shows.
 
+## Several clients, unreliable connections
+
+All state lives on the server. A client renders whatever `/api/status` reports
+and never trusts its own view, which is what makes the following work:
+
+* **Any number of clients can watch and control the same session.** When one
+  starts or stops a recording, the others see it within a second and say which
+  device did it. Every client can stop a recording, not only the one that
+  started it.
+* **A client going away changes nothing.** Close the tab, lock the iPad, walk
+  out of Wi-Fi range -- the recording keeps running on the server and keeps
+  every frame. Reconnecting rejoins the session in progress, with the correct
+  elapsed time.
+* **Two clients pressing start at once is not an error.** The one that loses the
+  race is told a recording is already running and who owns it, then simply
+  displays it. The same applies to stopping something already stopped.
+* **A dead preview is never shown as live.** MJPEG in an `<img>` freezes
+  silently when its connection dies, so the page watches for it: losing the
+  status poll greys out every tile and raises a banner, and streams are rebuilt
+  on reconnect. Individual frozen streams are also detected and reattached,
+  where the browser gives a per-frame signal to detect them with.
+* Stalled viewers are dropped server-side after 20 s rather than holding a
+  thread until TCP gives up.
+
 ## What a recording contains
 
 ```

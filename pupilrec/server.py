@@ -7,6 +7,8 @@ always stores every captured frame regardless of what the preview is showing.
 
 from __future__ import annotations
 
+import collections
+import contextlib
 import json
 import logging
 import os
@@ -24,10 +26,33 @@ logger = logging.getLogger(__name__)
 
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 BOUNDARY = "pupilframe"
+STREAM_WRITE_TIMEOUT = 20.0     # seconds before a stalled preview client is dropped
+
+
+class AlreadyRecording(Exception):
+    """Raised when a client asks to start while another already did."""
+
+    def __init__(self, name: str, started_by: str):
+        super().__init__(f"A recording is already running: {name}")
+        self.name = name
+        self.started_by = started_by
+
+
+class NotRecording(Exception):
+    """Raised when a client asks to stop a recording that is already stopped."""
+
+    def __init__(self):
+        super().__init__("No recording is running.")
 
 
 class AppState:
-    """Everything the request handlers share."""
+    """Everything the request handlers share.
+
+    This object is the single source of truth for what the system is doing.
+    Clients hold no state of their own: they render whatever /api/status says,
+    so a client can disappear and come back, or several can watch at once,
+    without any of them disagreeing about whether a recording is running.
+    """
 
     def __init__(self, cfg, workers):
         self.cfg = cfg
@@ -36,22 +61,57 @@ class AppState:
         self.lock = threading.Lock()
         self.last_result: dict | None = None
 
-    def start_recording(self, name: str) -> dict:
+        # Recording state lives here and nowhere else, so it survives any
+        # client going away and is identical for every client that asks.
+        # The version bumps on each change: a client that reconnects, or one
+        # that never disconnected, can tell "something changed while I was not
+        # looking" apart from "nothing has happened".
+        self.state_version = 0
+        self.started_by = ""       # client id that started the current recording
+        self.stopped_by = ""       # client id that stopped the last one
+
+        # Live preview viewers per camera, only for display.
+        self.viewers = collections.Counter()
+        self.viewers_lock = threading.Lock()
+
+    @contextlib.contextmanager
+    def viewer(self, cam_id: str):
+        with self.viewers_lock:
+            self.viewers[cam_id] += 1
+        try:
+            yield
+        finally:
+            with self.viewers_lock:
+                self.viewers[cam_id] -= 1
+                if self.viewers[cam_id] <= 0:
+                    del self.viewers[cam_id]
+
+    def start_recording(self, name: str, client: str = "") -> dict:
         with self.lock:
             if self.session is not None:
-                raise RuntimeError("A recording is already running.")
+                # Another client won the race; report the running recording
+                # rather than a bare failure, so the loser can just display it.
+                raise AlreadyRecording(self.session.name, self.started_by)
             os.makedirs(self.cfg.recordings_dir, exist_ok=True)
             self.session = RecordingSession(
                 self.cfg.recordings_dir, self.workers.values(), name
             )
-            return {"name": self.session.name, "directory": self.session.directory}
+            self.started_by = client
+            self.state_version += 1
+            return {"name": self.session.name, "directory": self.session.directory,
+                    "state_version": self.state_version}
 
-    def stop_recording(self) -> dict:
+    def stop_recording(self, client: str = "") -> dict:
         with self.lock:
             if self.session is None:
-                raise RuntimeError("No recording is running.")
+                raise NotRecording()
             session, self.session = self.session, None
+            self.stopped_by = client
+            self.state_version += 1
+            version = self.state_version
         result = session.stop()
+        result["state_version"] = version
+        result["stopped_by"] = client
         self.last_result = result
         return result
 
@@ -59,6 +119,8 @@ class AppState:
         with self.lock:
             session = self.session
         counts = session.live_counts() if session else {}
+        with self.viewers_lock:
+            viewers = dict(self.viewers)
         cameras = []
         for cam_id, worker in sorted(self.workers.items()):
             stats = worker.stats
@@ -79,11 +141,15 @@ class AppState:
                 "error": stats.error,
                 "recorded": counts.get(cam_id, {}).get("frames", 0),
                 "dropped_queue": counts.get(cam_id, {}).get("dropped_queue", 0),
+                "viewers": viewers.get(cam_id, 0),
             })
         return {
             "recording": session is not None,
             "recording_name": session.name if session else None,
             "elapsed_s": round(session.elapsed, 1) if session else 0.0,
+            "state_version": self.state_version,
+            "started_by": self.started_by if session else "",
+            "stopped_by": self.stopped_by,
             "cameras": cameras,
             "last_result": self.last_result,
             "server_time": time.time(),
@@ -92,6 +158,9 @@ class AppState:
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
+    # Reap keep-alive connections whose client vanished without closing, so a
+    # client that drops off the network repeatedly does not pile up threads.
+    timeout = 60
     state: AppState = None          # injected by serve()
 
     def log_message(self, fmt, *args):      # quieter than the default
@@ -147,13 +216,24 @@ class Handler(BaseHTTPRequestHandler):
         except json.JSONDecodeError:
             payload = {}
 
+        client = str(payload.get("client", ""))[:64]
         try:
             if url.path == "/api/start":
-                return self._send_json(self.state.start_recording(payload.get("name", "")))
+                return self._send_json(
+                    self.state.start_recording(payload.get("name", ""), client))
             if url.path == "/api/stop":
-                return self._send_json(self.state.stop_recording())
-        except RuntimeError as exc:
-            return self._error(str(exc), HTTPStatus.CONFLICT)
+                return self._send_json(self.state.stop_recording(client))
+        except AlreadyRecording as exc:
+            # Two clients pressed start at once.  The loser is not in error --
+            # it just needs to know a recording is running and who owns it.
+            return self._send_json(
+                {"error": str(exc), "recording": exc.name, "started_by": exc.started_by,
+                 "already": True},
+                HTTPStatus.CONFLICT)
+        except NotRecording as exc:
+            # Someone else stopped it first; the client's next poll will agree.
+            return self._send_json({"error": str(exc), "already": True},
+                                   HTTPStatus.CONFLICT)
         except Exception as exc:
             logger.exception("request failed")
             return self._error(str(exc), HTTPStatus.INTERNAL_SERVER_ERROR)
@@ -183,6 +263,11 @@ class Handler(BaseHTTPRequestHandler):
             target_fps = self.state.cfg.preview_fps.get(worker.role, 10.0)
         min_interval = 1.0 / target_fps
 
+        # When a viewer disappears mid-stream (Wi-Fi drop, iPad asleep) the write
+        # below would otherwise block until TCP gives up, minutes later, holding
+        # a thread and a stale viewer count.
+        self.connection.settimeout(STREAM_WRITE_TIMEOUT)
+
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", f"multipart/x-mixed-replace; boundary={BOUNDARY}")
         self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
@@ -193,22 +278,23 @@ class Handler(BaseHTTPRequestHandler):
         seq = -1
         next_due = 0.0
         try:
-            while True:
-                seq, frame = worker.latest_frame(after_seq=seq, timeout=5.0)
-                if frame is None:
-                    continue                       # camera silent; keep waiting
-                now = time.monotonic()
-                if now < next_due:
-                    continue                       # throttle: skip this frame
-                next_due = now + min_interval
-                head = (
-                    f"--{BOUNDARY}\r\n"
-                    f"Content-Type: image/jpeg\r\n"
-                    f"Content-Length: {len(frame.jpeg)}\r\n\r\n"
-                ).encode()
-                self.wfile.write(head)
-                self.wfile.write(frame.jpeg)
-                self.wfile.write(b"\r\n")
+            with self.state.viewer(cam_id):
+                while True:
+                    seq, frame = worker.latest_frame(after_seq=seq, timeout=5.0)
+                    if frame is None:
+                        continue                   # camera silent; keep waiting
+                    now = time.monotonic()
+                    if now < next_due:
+                        continue                   # throttle: skip this frame
+                    next_due = now + min_interval
+                    head = (
+                        f"--{BOUNDARY}\r\n"
+                        f"Content-Type: image/jpeg\r\n"
+                        f"Content-Length: {len(frame.jpeg)}\r\n\r\n"
+                    ).encode()
+                    self.wfile.write(head)
+                    self.wfile.write(frame.jpeg)
+                    self.wfile.write(b"\r\n")
         except (BrokenPipeError, ConnectionResetError, TimeoutError, OSError):
             pass                                    # viewer navigated away
 

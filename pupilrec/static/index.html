@@ -81,6 +81,12 @@
   th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--line); }
   th { color: var(--muted); font-weight: 600; }
   td.num { font-variant-numeric: tabular-nums; }
+  #offline {
+    margin: 18px 18px 0; padding: 13px 16px; border-radius: 12px;
+    background: #3a2326; border: 1px solid var(--rec); color: #ffd7d8; font-size: 14px;
+  }
+  #offline small { color: #d3a9ab; }
+  .stale { opacity: .35; filter: grayscale(1); transition: opacity .3s; }
   #toast {
     position: fixed; left: 50%; bottom: 26px; transform: translateX(-50%);
     background: var(--panel-2); border: 1px solid var(--line); border-radius: 10px;
@@ -94,7 +100,7 @@
 <header>
   <h1>Pupil Core felvevő</h1>
   <span class="pill"><span class="dot" id="linkDot"></span><span id="linkText">kapcsolódás…</span></span>
-  <span class="pill" id="recPill" hidden><span class="dot rec"></span><span id="elapsed">00:00</span></span>
+  <span class="pill" id="recPill" hidden><span class="dot rec"></span><span id="elapsed">00:00</span><span id="recWho"></span></span>
   <span class="spacer"></span>
   <label class="pill">Előnézet
     <select id="previewFps">
@@ -108,6 +114,11 @@
   <button id="recBtn" disabled>Felvétel indítása</button>
 </header>
 
+<div id="offline" hidden>
+  Nincs kapcsolat a szerverrel — újracsatlakozás… <span id="offlineFor"></span><br>
+  <small>A felvétel a szerveren fut tovább, ez a nézet nem befolyásolja.</small>
+</div>
+
 <main id="grid"></main>
 
 <section id="recordings">
@@ -119,45 +130,113 @@
 <div id="toast"></div>
 
 <script>
+/* The server owns all state.  This page renders whatever /api/status reports and
+   never assumes its own view is authoritative -- that is what lets several
+   clients drive the same recording, and what lets any of them disappear and
+   come back without confusing the others. */
+
 const LABELS = { left: "Bal oldali port", right: "Jobb oldali port" };
 const ROLES  = { world: "Főkamera", eye: "Szemkamera" };
 
-let recording = false;
+const POLL_MS = 1000;
+const STALE_AFTER_MS = 4000;      // no successful poll for this long => show as offline
+const STREAM_WATCHDOG_MS = 5000;  // frozen preview detection window
+
+/* A stable id for this device, so the server can say who started a recording
+   and every client can tell "I did that" from "someone else did". */
+const CLIENT_ID = (() => {
+  let id = null;
+  try { id = localStorage.getItem("pupilrec.client"); } catch {}
+  if (!id) {
+    id = "kliens-" + Math.random().toString(36).slice(2, 6);
+    try { localStorage.setItem("pupilrec.client", id); } catch {}
+  }
+  return id;
+})();
+
 let built = false;
+let online = false;
+let offlineSince = 0;
+let lastVersion = null;     // server state_version seen so far
+let lastRecording = null;
+let busy = false;           // a start/stop request is in flight
 let wakeLock = null;
 
 const $ = (id) => document.getElementById(id);
 
-function toast(msg, isError) {
+function toast(msg, kind) {
   const el = $("toast");
   el.textContent = msg;
-  el.style.borderColor = isError ? "var(--rec)" : "var(--line)";
+  el.style.borderColor = kind === "error" ? "var(--rec)"
+                       : kind === "info" ? "var(--accent)" : "var(--line)";
   el.classList.add("show");
   clearTimeout(el._t);
-  el._t = setTimeout(() => el.classList.remove("show"), 3600);
+  el._t = setTimeout(() => el.classList.remove("show"), 4200);
 }
+
+/* ---- preview streams -------------------------------------------------- */
 
 function streamUrl(id) {
   return `/stream/${id}?fps=${$("previewFps").value}&t=${Date.now()}`;
 }
 
-/* iOS Safari has historically been unreliable with multipart/x-mixed-replace.
-   If the stream image fails, that camera falls back to polling snapshots. */
+/* MJPEG in an <img> can freeze silently: if the connection dies mid-stream the
+   browser keeps showing the last frame with no error.  Some engines fire a load
+   event per frame, which makes a usable heartbeat -- but not all do, so a stream
+   is only watchdogged once this browser has proven it fires more than once. */
 function attachStream(img, id) {
   img.dataset.mode = "stream";
+  img.dataset.loads = "0";
+  img.dataset.lastLoad = String(Date.now());
+  img.classList.remove("stale");
+  img.onload = () => {
+    img.dataset.loads = String(Number(img.dataset.loads) + 1);
+    img.dataset.lastLoad = String(Date.now());
+    img.classList.remove("stale");
+  };
   img.onerror = () => { if (img.dataset.mode === "stream") startPolling(img, id); };
   img.src = streamUrl(id);
 }
+
+/* Fallback for browsers that refuse multipart/x-mixed-replace in an <img>. */
 function startPolling(img, id) {
   img.dataset.mode = "poll";
-  img.onerror = null;
+  img.onerror = () => setTimeout(tick, 1000);
   const tick = () => {
     if (img.dataset.mode !== "poll") return;
     img.src = `/snapshot/${id}?t=${Date.now()}`;
   };
-  img.onload = () => setTimeout(tick, 1000 / Number($("previewFps").value));
+  img.onload = () => {
+    img.dataset.lastLoad = String(Date.now());
+    img.classList.remove("stale");
+    setTimeout(tick, 1000 / Number($("previewFps").value));
+  };
   tick();
 }
+
+function eachImage(fn) {
+  document.querySelectorAll("main img").forEach(img => fn(img, img.id.replace("img-", "")));
+}
+
+function reattachAll() {
+  eachImage((img, id) => { img.dataset.mode = ""; attachStream(img, id); });
+}
+
+/* Reconnect a single stream that stopped delivering while the page is online. */
+setInterval(() => {
+  if (!online) return;
+  const now = Date.now();
+  eachImage((img, id) => {
+    const perFrameLoads = Number(img.dataset.loads) > 2;
+    const silent = now - Number(img.dataset.lastLoad) > STREAM_WATCHDOG_MS;
+    if (img.dataset.mode === "stream" && perFrameLoads && silent) {
+      img.classList.add("stale");
+      attachStream(img, id);
+    }
+  });
+}, STREAM_WATCHDOG_MS);
+
+/* ---- layout ----------------------------------------------------------- */
 
 function build(cameras) {
   const bySide = {};
@@ -180,7 +259,7 @@ function build(cameras) {
           <span class="name">${ROLES[cam.role] || cam.role}</span>
           <span>${cam.width}×${cam.height}</span>
           <span class="num" id="fps-${cam.id}">–</span>
-          <span class="spacer" style="flex:1"></span>
+          <span style="flex:1"></span>
           <span class="num" id="cnt-${cam.id}"></span>
         </div>`;
       cams.appendChild(div);
@@ -191,32 +270,70 @@ function build(cameras) {
   built = true;
 }
 
-function reattachAll() {
-  document.querySelectorAll("main img").forEach(img => {
-    const id = img.id.replace("img-", "");
-    img.dataset.mode = "";
-    attachStream(img, id);
-  });
-}
-
 function fmtDuration(s) {
   s = Math.max(0, Math.round(s));
   return String(Math.floor(s / 60)).padStart(2, "0") + ":" + String(s % 60).padStart(2, "0");
 }
 
+/* ---- connection state ------------------------------------------------- */
+
+function goOffline() {
+  if (online || offlineSince === 0) offlineSince = offlineSince || Date.now();
+  online = false;
+  $("linkDot").className = "dot";
+  $("linkText").textContent = "nincs kapcsolat";
+  $("offline").hidden = false;
+  $("offlineFor").textContent = `(${fmtDuration((Date.now() - offlineSince) / 1000)})`;
+  $("recBtn").disabled = true;
+  eachImage(img => img.classList.add("stale"));
+}
+
+function goOnline() {
+  const wasOffline = !online;
+  online = true;
+  offlineSince = 0;
+  $("offline").hidden = true;
+  if (wasOffline) {
+    // The preview sockets died with the connection; rebuild them all.
+    reattachAll();
+    loadRecordings();
+  }
+}
+
+/* ---- status polling --------------------------------------------------- */
+
 async function refresh() {
   let st;
   try {
-    st = await (await fetch("/api/status", { cache: "no-store" })).json();
+    const res = await fetch("/api/status", { cache: "no-store" });
+    if (!res.ok) throw new Error("status " + res.status);
+    st = await res.json();
   } catch {
-    $("linkDot").className = "dot";
-    $("linkText").textContent = "nincs kapcsolat";
+    goOffline();
     return;
   }
+  goOnline();
+
   $("linkDot").className = "dot on";
-  $("linkText").textContent = `${st.cameras.filter(c => c.connected).length}/${st.cameras.length} kamera`;
+  const viewers = st.cameras.reduce((a, c) => Math.max(a, c.viewers || 0), 0);
+  $("linkText").textContent =
+    `${st.cameras.filter(c => c.connected).length}/${st.cameras.length} kamera` +
+    (viewers > 1 ? ` · ${viewers} néző` : "");
 
   if (!built && st.cameras.length) build(st.cameras);
+
+  // Announce changes another client made, but only once per change and never
+  // for our own action (which already showed its own confirmation).
+  if (lastVersion !== null && st.state_version !== lastVersion) {
+    const mine = (st.recording ? st.started_by : st.stopped_by) === CLIENT_ID;
+    if (!mine) {
+      toast(st.recording
+        ? `Másik eszköz (${st.started_by || "ismeretlen"}) elindította a felvételt: ${st.recording_name}`
+        : `Másik eszköz (${st.stopped_by || "ismeretlen"}) leállította a felvételt`, "info");
+      if (!st.recording) loadRecordings();
+    }
+  }
+  lastVersion = st.state_version;
 
   st.cameras.forEach(c => {
     const fps = $(`fps-${c.id}`), cnt = $(`cnt-${c.id}`);
@@ -231,14 +348,30 @@ async function refresh() {
     }
   });
 
-  recording = st.recording;
-  $("recPill").hidden = !recording;
+  $("recPill").hidden = !st.recording;
   $("elapsed").textContent = fmtDuration(st.elapsed_s);
+  $("recWho").textContent =
+    st.recording && st.started_by && st.started_by !== CLIENT_ID ? ` · ${st.started_by}` : "";
+
   const btn = $("recBtn");
-  btn.disabled = st.cameras.length === 0;
-  btn.textContent = recording ? "Felvétel leállítása" : "Felvétel indítása";
-  btn.className = recording ? "rec" : "";
-  $("recName").disabled = recording;
+  btn.disabled = busy || st.cameras.length === 0;
+  btn.textContent = st.recording ? "Felvétel leállítása" : "Felvétel indítása";
+  btn.className = st.recording ? "rec" : "";
+  $("recName").disabled = st.recording;
+
+  // Keep the screen awake for whoever is watching a running recording.
+  if (st.recording && !wakeLock) acquireWakeLock();
+  if (!st.recording && wakeLock) releaseWakeLock();
+
+  lastRecording = st.recording;
+}
+
+async function acquireWakeLock() {
+  try { wakeLock = await navigator.wakeLock?.request("screen") ?? null; } catch { wakeLock = null; }
+}
+async function releaseWakeLock() {
+  try { await wakeLock?.release(); } catch {}
+  wakeLock = null;
 }
 
 async function loadRecordings() {
@@ -253,31 +386,42 @@ async function loadRecordings() {
   } catch { /* listing is optional */ }
 }
 
+/* ---- commands --------------------------------------------------------- */
+
 $("recBtn").onclick = async () => {
-  const btn = $("recBtn");
-  btn.disabled = true;
+  busy = true;
+  $("recBtn").disabled = true;
+  const starting = !lastRecording;
   try {
-    if (!recording) {
-      const res = await fetch("/api/start", {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ name: $("recName").value }),
-      });
-      const body = await res.json();
-      if (!res.ok) throw new Error(body.error || "ismeretlen hiba");
+    const res = starting
+      ? await fetch("/api/start", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ name: $("recName").value, client: CLIENT_ID }),
+        })
+      : await fetch("/api/stop", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ client: CLIENT_ID }),
+        });
+    const body = await res.json();
+
+    if (res.status === 409 && body.already) {
+      // Another client got there first.  Not an error: just resync.
+      toast(starting
+        ? `Már fut felvétel (${body.started_by || "másik eszköz"} indította)`
+        : "A felvételt már leállította valaki", "info");
+    } else if (!res.ok) {
+      throw new Error(body.error || "ismeretlen hiba");
+    } else if (starting) {
       toast("Felvétel indul: " + body.name);
-      try { wakeLock = await navigator.wakeLock?.request("screen"); } catch {}
     } else {
-      const res = await fetch("/api/stop", { method: "POST" });
-      const body = await res.json();
-      if (!res.ok) throw new Error(body.error || "ismeretlen hiba");
       const total = body.cameras.reduce((a, c) => a + c.frames, 0);
       toast(`Felvétel kész: ${body.name} — ${fmtDuration(body.duration_s)}, ${total} képkocka`);
-      try { await wakeLock?.release(); } catch {}
-      wakeLock = null;
-      loadRecordings();
     }
+    lastVersion = body.state_version ?? lastVersion;
   } catch (e) {
-    toast(e.message, true);
+    toast(e.message, "error");
+  } finally {
+    busy = false;
   }
   await refresh();
   loadRecordings();
@@ -286,12 +430,20 @@ $("recBtn").onclick = async () => {
 $("previewFps").onchange = reattachAll;
 
 document.addEventListener("visibilitychange", () => {
-  if (document.visibilityState === "visible") { reattachAll(); refresh(); }
+  if (document.visibilityState !== "visible") return;
+  // iOS drops both the wake lock and the stream sockets when the page is hidden.
+  reattachAll();
+  refresh();
+  if (lastRecording) acquireWakeLock();
 });
+
+window.addEventListener("online", () => { refresh(); });
+window.addEventListener("offline", goOffline);
 
 refresh();
 loadRecordings();
-setInterval(refresh, 1000);
+setInterval(refresh, POLL_MS);
+setInterval(() => { if (!online && offlineSince) goOffline(); }, 1000);
 </script>
 </body>
 </html>
