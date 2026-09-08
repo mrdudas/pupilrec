@@ -9,10 +9,15 @@ from dataclasses import asdict, dataclass, field
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CONFIG_PATH = os.path.join(PROJECT_ROOT, "config.json")
 
-# Highest mode each camera type offers in MJPEG (verified against the hardware:
-# see docs/USB-BANDWIDTH.md).  (width, height, fps)
+# (width, height, fps), MJPEG, verified against the hardware.
+#
+# The eye cameras run at their maximum.  The world cameras trade resolution for
+# frame rate: they offer either 1920x1080 at 30 fps or 1280x720 at 60 fps, and
+# 60 fps is the more useful of the two here.  It is also cheaper -- 720p frames
+# are less than half the size, so twice as many of them still cost slightly less
+# bandwidth and disk than 1080p30 (15.7 vs 16.6 MB/s across all four cameras).
 DEFAULT_MODES = {
-    "world": (1920, 1080, 30),
+    "world": (1280, 720, 60),
     "eye": (400, 400, 120),
 }
 

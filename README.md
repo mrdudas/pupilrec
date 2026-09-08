@@ -3,8 +3,12 @@
 Live view and synchronised recording of two Pupil Core headsets (four cameras)
 from a browser -- built for driving it from an iPad.
 
-* **World cameras** — 1920x1080 MJPEG @ 30 fps (the sensor's maximum)
+* **World cameras** — 1280x720 MJPEG @ 60 fps
 * **Eye cameras** — 400x400 MJPEG @ 120 fps (the sensor's maximum)
+
+The world cameras can do either 1920x1080@30 or 1280x720@60; the higher frame
+rate is the default. Change it in `config.json` (`modes.world`) if the extra
+resolution is worth more than the extra frames on a given day.
 * Frames are **never decoded or re-encoded**: the JPEGs the cameras emit are the
   JPEGs stored in the video file and the JPEGs sent to the browser.
 * Every recording ships a per-camera CSV mapping frame number to wall clock time.
@@ -106,12 +110,13 @@ Storing JPEG untouched costs disk instead of CPU, which is the intended trade:
 
 | stream | rate |
 |---|---|
-| world camera (1080p30) | ~7 MB/s each |
+| world camera (720p60) | ~6 MB/s each |
 | eye camera (400x400@120) | ~2 MB/s each |
-| **all four together** | **~18 MB/s, ~65 GB/hour** |
+| **all four together** | **~16 MB/s, ~57 GB/hour** |
 
-Measured on a 20 s recording: 4805 eye frames and 1196 world frames, **zero
-dropped**, all four cameras started within 12 ms of each other.
+Measured on a 15 s recording: 3604 eye frames and 1793 world frames, **zero
+dropped** on any camera and no gaps in any device frame counter. 1080p30 costs
+slightly more (16.6 MB/s) for half the world frame rate.
 
 If the disk stalls, frames are dropped rather than blocking capture (that would
 corrupt timing on every camera sharing the bus); the count shows up per camera
