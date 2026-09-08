@@ -1,0 +1,7 @@
+# STEVAL-STWINKT1B running the FP-SNS-DATALOG1 "Multi Sensor Streaming" firmware.
+# It is a vendor-class USB device driven from user space through libusb, so it
+# needs raw access.  Same grants as the cameras: plugdev for services started at
+# boot, uaccess for a local desktop session.
+SUBSYSTEM=="usb", ATTR{idVendor}=="0483", ATTR{idProduct}=="5744", MODE="0660", GROUP="plugdev", TAG+="uaccess"
+# The non-B board variant reports a different product id.
+SUBSYSTEM=="usb", ATTR{idVendor}=="0483", ATTR{idProduct}=="5743", MODE="0660", GROUP="plugdev", TAG+="uaccess"

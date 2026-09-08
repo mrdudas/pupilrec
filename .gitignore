@@ -4,3 +4,5 @@ __pycache__/
 *.pyc
 recordings/
 config.json
+# ST's prebuilt library; setup/install.sh fetches it.
+vendor/

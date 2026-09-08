@@ -1,0 +1,25 @@
+# STWIN sensor recorder.  Separate unit from pupilrec on purpose: the cameras
+# must not be affected if the board or this process misbehaves.
+#   sudo cp setup/pupilrec-sensors.service /etc/systemd/system/
+#   sudo systemctl enable --now pupilrec-sensors
+[Unit]
+Description=STWIN sensor recorder (follows the camera recorder)
+After=network-online.target pupilrec.service
+Wants=pupilrec.service
+
+[Service]
+Type=simple
+User=zsolt
+# plugdev carries the raw USB access granted by 71-stwin-datalog.rules.
+SupplementaryGroups=plugdev
+WorkingDirectory=/home/zsolt/aimotive
+ExecStart=/home/zsolt/aimotive/.venv/bin/python /home/zsolt/aimotive/run_sensors.py
+# SIGKILL while the board is streaming wedges its USB stack until someone
+# presses reset, so give the daemon time to stop the log cleanly.
+KillSignal=SIGTERM
+TimeoutStopSec=30
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

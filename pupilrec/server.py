@@ -146,6 +146,8 @@ class AppState:
         return {
             "recording": session is not None,
             "recording_name": session.name if session else None,
+            # The sensor daemon writes its CSVs into this same directory.
+            "recording_directory": session.directory if session else None,
             "elapsed_s": round(session.elapsed, 1) if session else 0.0,
             "state_version": self.state_version,
             "started_by": self.started_by if session else "",

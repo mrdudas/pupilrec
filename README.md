@@ -93,6 +93,28 @@ and never trusts its own view, which is what makes the following work:
 * Stalled viewers are dropped server-side after 20 s rather than holding a
   thread until TCP gives up.
 
+## Sensor board
+
+A STEVAL-STWINKT1B records its ten sensors into the same recording directory,
+driven by `run_sensors.py` as a **separate process** -- it shares no thread,
+lock or USB bandwidth with the cameras, and follows the recorder's HTTP status
+to know when to start and stop.
+
+```sh
+./run_sensors.py --probe     # list what the board offers
+./run_sensors.py             # follow the recorder and log alongside it
+sudo cp setup/pupilrec-sensors.service /etc/systemd/system/
+sudo systemctl enable --now pupilrec-sensors
+```
+
+Vibration and motion sensors, magnetometer, pressure and temperature go to CSV,
+one file each. The two microphones go to WAV plus a timestamp table, because CSV
+at 192 kHz demonstrably loses samples. Details, the stream format and the
+measured rates are in [docs/STWIN-SENSORS.md](docs/STWIN-SENSORS.md).
+
+**Never `kill -9` the sensor daemon**: a process killed while the board streams
+wedges the board until someone presses its RESET button.
+
 ## What a recording contains
 
 ```
@@ -105,8 +127,26 @@ recordings/2026-09-08_19-55-29_teszt/
 ├── right_world.csv
 ├── right_eye.mkv
 ├── right_eye.csv
-└── recording.json    modes, camera identities, start/stop, per-camera results
+├── recording.json    modes, camera identities, start/stop, per-camera results
+├── stwin_iis3dwb_acc.csv        vibration, 26.7 kHz
+├── stwin_ism330dhcx_acc.csv     IMU accelerometer
+├── stwin_ism330dhcx_gyro.csv    IMU gyroscope
+├── stwin_iis2dh_acc.csv         accelerometer
+├── stwin_iis2mdc_mag.csv        magnetometer
+├── stwin_lps22hh_press.csv      pressure
+├── stwin_lps22hh_temp.csv       temperature
+├── stwin_stts751_temp.csv       temperature
+├── stwin_imp23absu_mic.wav      analog microphone, 192 kHz
+├── stwin_imp23absu_mic_timestamps.csv
+├── stwin_imp34dt05_mic.wav      digital microphone, 48 kHz
+├── stwin_imp34dt05_mic_timestamps.csv
+├── stwin_board.json  every sensor's configuration as the board reported it
+└── stwin_recording.json  per-sensor row counts, lost bytes, timing
 ```
+
+Every sensor CSV carries `sample_index, unix_time, device_time` and one column
+per channel. `unix_time` is the same host clock as the camera tables, so sensor
+rows and video frames line up directly.
 
 Each CSV row is one frame of the corresponding video, in order:
 

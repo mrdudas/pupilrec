@@ -60,8 +60,20 @@ if [ ! -d "${BUILD}/pyuvc" ]; then
 fi
 PKG_CONFIG_PATH=/usr/local/lib/pkgconfig ./.venv/bin/pip install "${BUILD}/pyuvc"
 
+# The STWIN board is driven through ST's prebuilt library.  Only the v2 one
+# works: v1 hardcodes USB product id 0x5743 and reports zero devices for a
+# board that enumerates as 0x5744 (docs/STWIN-SENSORS.md).
+echo "==> STWIN support library"
+if [ ! -d "${BUILD}/datalog1" ]; then
+    git clone --depth 1 https://github.com/STMicroelectronics/fp-sns-datalog1 "${BUILD}/datalog1"
+fi
+mkdir -p "${ROOT}/vendor"
+cp "${BUILD}/datalog1/Utilities/HSDPython_SDK/st_hsdatalog/st_hsdatalog/HSD_link/communication/libhs_datalog/linux/libhs_datalog_v2.so" \
+   "${ROOT}/vendor/"
+
 echo "==> udev rules"
 sudo install -m 0644 "${ROOT}/setup/70-pupil-cams.rules" /etc/udev/rules.d/
+sudo install -m 0644 "${ROOT}/setup/71-stwin-datalog.rules" /etc/udev/rules.d/
 sudo udevadm control --reload-rules
 sudo udevadm trigger --subsystem-match=usb --action=add
 sleep 2
