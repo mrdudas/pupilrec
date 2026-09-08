@@ -1,0 +1,214 @@
+<!doctype html>
+<html lang="hu">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>Térkép — Pupil Core felvevő</title>
+<link rel="stylesheet" href="/vendor/leaflet.css">
+<style>
+  :root {
+    --bg: #14161a; --panel: #1e2229; --panel-2: #262b34; --line: #333a45;
+    --text: #e8ebef; --muted: #9aa4b2; --accent: #4c8dff; --rec: #e5484d; --ok: #3dd68c;
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { height: 100%; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text); display: flex; flex-direction: column;
+    font: 15px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
+  }
+  header {
+    display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+    padding: 12px 18px; background: var(--panel); border-bottom: 1px solid var(--line);
+  }
+  h1 { font-size: 17px; margin: 0; font-weight: 600; }
+  a.back { color: var(--accent); text-decoration: none; font-size: 14px; }
+  .spacer { flex: 1; }
+  .pill {
+    display: inline-flex; align-items: center; gap: 8px; padding: 6px 12px;
+    border-radius: 999px; background: var(--panel-2); font-size: 13px; color: var(--muted);
+  }
+  .pill.ok { color: var(--text); }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--muted); }
+  .dot.on { background: var(--ok); }
+  select, button {
+    font: inherit; color: var(--text); background: var(--panel-2);
+    border: 1px solid var(--line); border-radius: 10px; padding: 9px 13px; min-height: 42px;
+  }
+  button.active { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+  #map { flex: 1; min-height: 0; background: #2b2f38; }
+  .leaflet-container { background: #2b2f38; }
+  footer {
+    padding: 9px 18px; background: var(--panel); border-top: 1px solid var(--line);
+    font-size: 12.5px; color: var(--muted); display: flex; gap: 18px; flex-wrap: wrap;
+  }
+  footer b { color: var(--text); font-weight: 600; font-variant-numeric: tabular-nums; }
+  #notice {
+    position: absolute; left: 50%; transform: translateX(-50%); top: 78px; z-index: 500;
+    background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+    padding: 11px 16px; font-size: 13.5px; max-width: 90vw; color: var(--muted);
+  }
+  #notice[hidden] { display: none; }
+</style>
+</head>
+<body>
+
+<header>
+  <a class="back" href="/">← Vissza</a>
+  <h1>Térkép</h1>
+  <span class="pill" id="fixPill"><span class="dot" id="fixDot"></span><span id="fixText">…</span></span>
+  <span class="spacer"></span>
+  <select id="dateSelect" title="Nap"></select>
+  <button id="followBtn" class="active">Követés</button>
+</header>
+
+<div id="map"></div>
+<div id="notice" hidden></div>
+
+<footer>
+  <span>pozíció: <b id="pos">—</b></span>
+  <span>sebesség: <b id="speed">—</b></span>
+  <span>pontosság: <b id="acc">—</b></span>
+  <span>műhold: <b id="sats">—</b></span>
+  <span>nyomvonal: <b id="pts">0</b> pont</span>
+  <span>csempe: <b id="tiles">—</b></span>
+</footer>
+
+<script src="/vendor/leaflet.js"></script>
+<script>
+/* Tiles come from this server, which caches them on disk -- the tablet needs
+   no internet of its own, and anywhere already looked at works offline. */
+const map = L.map("map", { zoomControl: true, attributionControl: true })
+  .setView([47.4979, 19.0402], 12);      // Budapest until the first fix arrives
+
+L.tileLayer("/tiles/{z}/{x}/{y}.png", {
+  maxZoom: 19,
+  attribution: '&copy; OpenStreetMap közreműködők',
+}).addTo(map);
+
+const track = L.polyline([], { color: "#4c8dff", weight: 4, opacity: .85 }).addTo(map);
+const here = L.circleMarker([0, 0], {
+  radius: 7, color: "#fff", weight: 2, fillColor: "#e5484d", fillOpacity: 1,
+});
+const accuracy = L.circle([0, 0], { radius: 0, color: "#e5484d", weight: 1, fillOpacity: .08 });
+
+let follow = true;
+let haveFix = false;
+let loaded = 0;              // points already drawn for the selected day
+let selectedDate = "";
+let seenFirstFix = false;
+
+const $ = (id) => document.getElementById(id);
+
+function notice(text) {
+  const el = $("notice");
+  if (!text) { el.hidden = true; return; }
+  el.hidden = false;
+  el.textContent = text;
+}
+
+$("followBtn").onclick = () => {
+  follow = !follow;
+  $("followBtn").classList.toggle("active", follow);
+};
+// Any manual pan turns following off, so the map stops fighting the user.
+map.on("dragstart", () => { follow = false; $("followBtn").classList.remove("active"); });
+
+$("dateSelect").onchange = () => {
+  selectedDate = $("dateSelect").value;
+  loaded = 0;
+  seenFirstFix = false;
+  track.setLatLngs([]);
+  loadTrack();
+};
+
+// ?date=YYYY-MM-DD opens a given day directly, which also makes a view shareable.
+const wantedDate = new URLSearchParams(location.search).get("date") || "";
+
+/* Log files are named for the local date, so "today" must be local too.
+   toISOString() would give the UTC date and pick the wrong day for the first
+   couple of hours after midnight. */
+function localToday() {
+  const d = new Date();
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+}
+
+async function loadDates() {
+  try {
+    const { dates } = await (await fetch("/api/gps/dates", { cache: "no-store" })).json();
+    const today = localToday();
+    if (!dates.includes(today)) dates.unshift(today);
+    if (wantedDate && !dates.includes(wantedDate)) dates.unshift(wantedDate);
+    const keep = $("dateSelect").value || wantedDate || today;
+    $("dateSelect").innerHTML = dates
+      .map(d => `<option value="${d}"${d === keep ? " selected" : ""}>${d}</option>`).join("");
+    selectedDate = $("dateSelect").value;
+  } catch { /* the selector is a convenience, not a requirement */ }
+}
+
+async function loadTrack() {
+  let data;
+  try {
+    const url = `/api/gps/track?date=${encodeURIComponent(selectedDate)}&after=${loaded}`;
+    data = await (await fetch(url, { cache: "no-store" })).json();
+  } catch {
+    notice("Nincs kapcsolat a szerverrel.");
+    return;
+  }
+
+  if (data.points.length) {
+    data.points.forEach(p => track.addLatLng([p[0], p[1]]));
+    loaded = data.total;
+  }
+  $("pts").textContent = data.total;
+
+  const last = data.latest;
+  if (last) {
+    haveFix = true;
+    here.setLatLng([last.lat, last.lon]).addTo(map);
+    accuracy.setLatLng([last.lat, last.lon]).setRadius(last.h_acc_m || 0).addTo(map);
+    $("pos").textContent = `${last.lat.toFixed(6)}, ${last.lon.toFixed(6)}`;
+    $("speed").textContent = last.speed_mps != null
+      ? `${(last.speed_mps * 3.6).toFixed(1)} km/h` : "—";
+    $("acc").textContent = last.h_acc_m != null ? `± ${last.h_acc_m.toFixed(1)} m` : "—";
+    if (!seenFirstFix) {
+      seenFirstFix = true;
+      map.setView([last.lat, last.lon], Math.max(map.getZoom(), 16));
+    } else if (follow) {
+      map.panTo([last.lat, last.lon], { animate: true });
+    }
+    notice("");
+  } else if (!data.exists) {
+    notice(`Ehhez a naphoz (${data.date}) nincs GPS napló.`);
+  } else if (data.rows) {
+    notice(`${data.rows} mérés érkezett, de még egyszer sem volt műholdas fix — `
+           + "beltéren ez természetes. A nyomvonal magától megjelenik, amint van jel.");
+  }
+}
+
+async function loadStatus() {
+  try {
+    const h = await (await fetch("/api/health", { cache: "no-store" })).json();
+    const g = h.gps || {};
+    const live = g.running && g.connected;
+    $("fixDot").className = "dot" + (g.fix_ok ? " on" : "");
+    $("fixPill").classList.toggle("ok", !!g.fix_ok);
+    $("fixText").textContent = !live ? "GPS nincs csatlakoztatva"
+      : g.fix_ok ? `fix: ${g.fix} · ${g.rate_hz} Hz` : `nincs fix · ${g.rate_hz} Hz`;
+    $("sats").textContent = live ? g.num_sv : "—";
+    const t = h.tiles || {};
+    $("tiles").textContent = t.cached_tiles != null
+      ? `${t.cached_tiles} db (${(t.cache_bytes / 1e6).toFixed(1)} MB)` : "—";
+  } catch { /* the header is cosmetic; the map keeps working */ }
+}
+
+loadDates().then(loadTrack);
+loadStatus();
+setInterval(loadTrack, 1000);
+setInterval(loadStatus, 3000);
+setInterval(loadDates, 60000);
+</script>
+</body>
+</html>

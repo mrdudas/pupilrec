@@ -10,3 +10,5 @@ vendor/
 var/
 # Continuous GNSS logs.
 gps/
+# Cached map tiles; fetched on demand at runtime.
+tiles/

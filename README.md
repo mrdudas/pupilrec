@@ -139,6 +139,26 @@ nothing else is affected; unplugging it mid-run is not an error and it is picked
 back up automatically, typically within five seconds. Recordings made without it
 simply contain no GPS file.
 
+## Map
+
+`/map` (linked from the header) draws the day's GNSS track and the live
+position, updating once a second. A date selector reaches earlier days, and
+`?date=YYYY-MM-DD` opens one directly. "Követés" keeps the map centred on the
+device; panning by hand turns it off.
+
+**Map tiles are cached by this server**, so the tablet needs no internet of its
+own -- it always talks to the recorder, which fetches a tile from OpenStreetMap
+the first time anyone looks at it and serves it from `tiles/` forever after.
+Area already viewed therefore works fully offline. Tiles are fetched **only on
+demand**, never by pre-loading an area, which is what the OSM tile usage policy
+requires; when a tile is missing and there is no connection, a flat grey square
+stands in rather than a broken image.
+
+A day at 10 Hz is close to a million rows, so the track is thinned for display:
+a point is kept once the track has moved 2 m or 5 s have passed. A stationary
+period costs one point every five seconds instead of fifty. Leaflet is served
+from `pupilrec/static/vendor/`, not a CDN.
+
 ## When something wedges
 
 The UI has a **Rendszer állapota** panel showing whether the cameras stream, the

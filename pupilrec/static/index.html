@@ -29,6 +29,7 @@
     position: sticky; top: 0; z-index: 10;
   }
   h1 { font-size: 17px; margin: 0; font-weight: 600; letter-spacing: .2px; }
+  a.maplink { color: var(--accent); text-decoration: none; font-size: 14px; }
   .spacer { flex: 1; }
   .pill {
     display: inline-flex; align-items: center; gap: 8px; padding: 6px 12px;
@@ -114,6 +115,7 @@
 
 <header>
   <h1>Pupil Core felvevő</h1>
+  <a class="maplink" href="/map">Térkép →</a>
   <span class="pill"><span class="dot" id="linkDot"></span><span id="linkText">kapcsolódás…</span></span>
   <span class="pill" id="recPill" hidden><span class="dot rec"></span><span id="elapsed">00:00</span><span id="recWho"></span></span>
   <span class="spacer"></span>

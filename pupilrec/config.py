@@ -30,6 +30,10 @@ class Config:
     headsets: dict[str, str] = field(default_factory=dict)
 
     recordings_dir: str = os.path.join(PROJECT_ROOT, "recordings")
+    # Where the GNSS logger writes its daily files; the map page reads them.
+    gps_dir: str = os.path.join(PROJECT_ROOT, "gps")
+    # Map tiles are cached here so the tablet needs no internet of its own.
+    tiles_dir: str = os.path.join(PROJECT_ROOT, "tiles")
 
     # Passed to libuvc when starting a stream.  It scales the isochronous
     # bandwidth the driver reserves; the kernel's uvcvideo driver always asks

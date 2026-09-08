@@ -12,6 +12,7 @@ import contextlib
 import json
 import logging
 import os
+import re
 import socket
 import threading
 import time
@@ -23,6 +24,8 @@ from urllib.parse import parse_qs, urlparse
 import shutil
 import subprocess
 
+from .gpstrack import TrackStore
+from .tiles import TileCache
 from .recording import RecordingSession
 
 logger = logging.getLogger(__name__)
@@ -30,6 +33,7 @@ logger = logging.getLogger(__name__)
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 BOUNDARY = "pupilframe"
 STREAM_WRITE_TIMEOUT = 20.0     # seconds before a stalled preview client is dropped
+_SAFE_DATE = re.compile(r"\d{4}-\d{2}-\d{2}")
 
 # Privileged recovery actions, run through a sudoers rule that allows exactly
 # these three arguments and nothing else (setup/pupilrec-sudoers).
@@ -85,6 +89,9 @@ class AppState:
         # Live preview viewers per camera, only for display.
         self.viewers = collections.Counter()
         self.viewers_lock = threading.Lock()
+
+        self.tracks = TrackStore(cfg.gps_dir)
+        self.tiles = TileCache(cfg.tiles_dir)
 
     @contextlib.contextmanager
     def viewer(self, cam_id: str):
@@ -191,6 +198,57 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _send_static(self, name: str, content_type: str):
+        try:
+            with open(os.path.join(STATIC_DIR, name), "rb") as fh:
+                return self._send_bytes(fh.read(), content_type)
+        except OSError:
+            return self._error("Not found", HTTPStatus.NOT_FOUND)
+
+    def _send_tile(self, spec: str):
+        """/tiles/<z>/<x>/<y>.png -- from disk, or fetched once and kept."""
+        parts = spec.split("/")
+        if len(parts) != 3 or not parts[2].endswith(".png"):
+            return self._error("Not found", HTTPStatus.NOT_FOUND)
+        try:
+            z, x, y = int(parts[0]), int(parts[1]), int(parts[2][:-4])
+        except ValueError:
+            return self._error("Not found", HTTPStatus.NOT_FOUND)
+
+        body, source = self.state.tiles.get(z, x, y)
+        if body is None:
+            return self._error("Not found", HTTPStatus.NOT_FOUND)
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "image/png")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("X-Tile-Source", source)
+        # A cached tile is immutable for our purposes; a placeholder is not,
+        # because the real one should be fetched next time there is a network.
+        self.send_header("Cache-Control",
+                         "public, max-age=604800" if source != "missing" else "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _send_vendor(self, name: str):
+        # Leaflet is served from here rather than a CDN so the map page needs
+        # nothing from the internet but the tiles themselves.
+        types = {".js": "application/javascript", ".css": "text/css"}
+        suffix = os.path.splitext(name)[1]
+        if suffix not in types or "/" in name or ".." in name:
+            return self._error("Not found", HTTPStatus.NOT_FOUND)
+        path = os.path.join(STATIC_DIR, "vendor", name)
+        try:
+            with open(path, "rb") as fh:
+                body = fh.read()
+        except OSError:
+            return self._error("Not found", HTTPStatus.NOT_FOUND)
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", types[suffix])
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "public, max-age=86400")
+        self.end_headers()
+        self.wfile.write(body)
+
     def _send_bytes(self, body: bytes, content_type: str):
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", content_type)
@@ -209,8 +267,24 @@ class Handler(BaseHTTPRequestHandler):
         path, query = url.path, parse_qs(url.query)
 
         if path in ("/", "/index.html"):
-            with open(os.path.join(STATIC_DIR, "index.html"), "rb") as fh:
-                return self._send_bytes(fh.read(), "text/html; charset=utf-8")
+            return self._send_static("index.html", "text/html; charset=utf-8")
+        if path in ("/map", "/map.html"):
+            return self._send_static("map.html", "text/html; charset=utf-8")
+        if path.startswith("/tiles/"):
+            return self._send_tile(path[len("/tiles/"):])
+        if path.startswith("/vendor/"):
+            return self._send_vendor(path[len("/vendor/"):])
+        if path == "/api/gps/dates":
+            return self._send_json({"dates": self.state.tracks.available_dates()})
+        if path == "/api/gps/track":
+            try:
+                after = int(query.get("after", ["0"])[0])
+            except ValueError:
+                after = 0
+            day = query.get("date", [""])[0]
+            if day and not _SAFE_DATE.fullmatch(day):
+                return self._error("Bad date")
+            return self._send_json(self.state.tracks.track(day, after))
         if path == "/api/status":
             return self._send_json(self.state.status())
         if path == "/api/health":
@@ -343,6 +417,7 @@ class Handler(BaseHTTPRequestHandler):
                 "pupilrec-sensors": self._service_state("pupilrec-sensors.service"),
                 "pupilrec-gps": self._service_state("pupilrec-gps.service"),
             },
+            "tiles": self.state.tiles.stats(),
             "recovery_available": os.access(RECOVER_HELPER, os.X_OK),
             "recording": self.state.status()["recording"],
         }
