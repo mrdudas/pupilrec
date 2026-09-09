@@ -51,8 +51,27 @@ class Config:
         default_factory=lambda: {"world": 10.0, "eye": 10.0}
     )
 
+    # Image controls (brightness, gain, exposure, ...) per camera id, as
+    # {"left_world": {"Brightness": 32, ...}}.  The value really does live in
+    # the camera -- but only until it loses power, and a headset loses power on
+    # every replug and every reboot.  So what the operator sets is kept here and
+    # written back into the camera each time it is opened; this file is what
+    # makes a setting outlast the cable being pulled.
+    camera_controls: dict[str, dict[str, int]] = field(default_factory=dict)
+
     host: str = "0.0.0.0"
     port: int = 8080
+
+    def controls_for(self, cam_id: str) -> dict[str, int]:
+        """The stored control values for one camera, keyed by control name."""
+        return dict(self.camera_controls.get(cam_id, {}))
+
+    def remember_control(self, cam_id: str, name: str, value: int) -> None:
+        self.camera_controls.setdefault(cam_id, {})[name] = int(value)
+
+    def forget_controls(self, cam_id: str) -> None:
+        """Drop the stored values so the camera keeps its own defaults."""
+        self.camera_controls.pop(cam_id, None)
 
     def mode_for(self, role: str) -> tuple[int, int, int]:
         w, h, fps = self.modes.get(role, DEFAULT_MODES[role])

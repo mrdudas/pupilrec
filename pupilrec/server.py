@@ -90,6 +90,10 @@ class AppState:
         self.viewers = collections.Counter()
         self.viewers_lock = threading.Lock()
 
+        # config.json is rewritten whenever a camera control changes; two
+        # clients turning knobs at once must not interleave inside the file.
+        self.config_lock = threading.Lock()
+
         self.tracks = TrackStore(cfg.gps_dir)
         # Cameras attached since start-up, which need a restart to be used.
         self.pending_cameras: list[dict] = []
@@ -119,6 +123,40 @@ class AppState:
              "port": cam.root_port}
             for cam in attached if cam.usb_path not in known
         ]
+
+    def camera_controls(self, cam_id: str, refresh: bool = False) -> dict:
+        """Every image control of one camera.
+
+        Cached values by default; `refresh` re-reads them from the camera,
+        which is slow enough to be the operator's decision rather than a
+        side effect of opening the panel.
+        """
+        worker = self.workers[cam_id]
+        return {"camera": cam_id, "side": worker.side, "role": worker.role,
+                "product": worker.product, "refreshed": refresh,
+                "controls": worker.list_controls(refresh_all=refresh)}
+
+    def set_camera_control(self, cam_id: str, name: str, value: int) -> dict:
+        """Write one control and persist it, so it survives a replug."""
+        worker = self.workers[cam_id]
+        controls = worker.set_control(name, value)
+        with self.config_lock:
+            # Store what the camera ended up with, not what was asked for: it
+            # clamps values it cannot reach, and the stored value has to be the
+            # one that will be written back on the next open.
+            applied = next((c for c in controls if c["name"] == name), None)
+            self.cfg.remember_control(
+                cam_id, name, applied["value"] if applied else value)
+            self.cfg.save()
+        return {"camera": cam_id, "controls": controls}
+
+    def reset_camera_controls(self, cam_id: str) -> dict:
+        worker = self.workers[cam_id]
+        controls = worker.reset_controls()
+        with self.config_lock:
+            self.cfg.forget_controls(cam_id)
+            self.cfg.save()
+        return {"camera": cam_id, "controls": controls}
 
     def start_recording(self, name: str, client: str = "") -> dict:
         with self.lock:
@@ -306,6 +344,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_json(self._health())
         if path == "/api/recordings":
             return self._send_json({"recordings": self._list_recordings()})
+        if path.startswith("/api/controls/"):
+            return self._controls(path[len("/api/controls/"):], query)
         if path.startswith("/snapshot/"):
             return self._snapshot(path.rsplit("/", 1)[-1])
         if path.startswith("/stream/"):
@@ -330,6 +370,9 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_json(self.state.stop_recording(client))
             if url.path == "/api/restart":
                 return self._restart(payload)
+            if url.path.startswith("/api/controls/"):
+                return self._set_control(
+                    url.path[len("/api/controls/"):], payload)
         except AlreadyRecording as exc:
             # Two clients pressed start at once.  The loser is not in error --
             # it just needs to know a recording is running and who owns it.
@@ -345,6 +388,39 @@ class Handler(BaseHTTPRequestHandler):
             logger.exception("request failed")
             return self._error(str(exc), HTTPStatus.INTERNAL_SERVER_ERROR)
         return self._error("Not found", HTTPStatus.NOT_FOUND)
+
+    # -- image controls ---------------------------------------------------
+
+    def _controls(self, cam_id: str, query):
+        if cam_id not in self.state.workers:
+            return self._error("Unknown camera", HTTPStatus.NOT_FOUND)
+        refresh = query.get("refresh", ["0"])[0] not in ("0", "", "false")
+        try:
+            return self._send_json(self.state.camera_controls(cam_id, refresh))
+        except (RuntimeError, TimeoutError) as exc:
+            # A camera that is unplugged or wedged cannot answer; that is a
+            # state to report, not a server fault.
+            return self._error(str(exc), HTTPStatus.SERVICE_UNAVAILABLE)
+
+    def _set_control(self, cam_id: str, payload):
+        if cam_id not in self.state.workers:
+            return self._error("Unknown camera", HTTPStatus.NOT_FOUND)
+        try:
+            if payload.get("reset"):
+                return self._send_json(self.state.reset_camera_controls(cam_id))
+            name = str(payload.get("name", ""))
+            if not name:
+                return self._error("Which control?")
+            try:
+                value = int(payload["value"])
+            except (KeyError, TypeError, ValueError):
+                return self._error("A control value must be a whole number")
+            return self._send_json(
+                self.state.set_camera_control(cam_id, name, value))
+        except TimeoutError as exc:
+            return self._error(str(exc), HTTPStatus.SERVICE_UNAVAILABLE)
+        except RuntimeError as exc:
+            return self._error(str(exc), HTTPStatus.CONFLICT)
 
     # -- media -----------------------------------------------------------
 

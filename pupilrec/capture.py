@@ -8,6 +8,7 @@ then only ever passed around as bytes.
 from __future__ import annotations
 
 import logging
+import queue
 import threading
 import time
 from dataclasses import dataclass, field
@@ -31,6 +32,80 @@ FIRST_FRAME_TIMEOUT = 4.0  # bounds the one call that could otherwise never retu
 # failing with "Can't start isochronous stream" while the others wedge.  Grabbing
 # frames in parallel is fine -- only setup and teardown need serialising.
 _device_lock = threading.Lock()
+
+# A control request is served by the capture thread between two frames, but it
+# also queues behind _device_lock, which another camera can hold for a whole
+# open.  The budget covers both; past it the camera really is wedged.
+CONTROL_TIMEOUT = 12.0
+
+# UVC GET_INFO bits: what the camera says it will let us do with a control.
+# (Bit 0, "supports GET", is true of everything these cameras report.)
+INFO_SET = 1 << 1
+INFO_AUTO_DISABLED = 1 << 2      # set right now because an "auto" mode owns it
+
+
+def describe_control(ctrl) -> dict:
+    """One pyuvc Control as JSON the UI can build an input out of.
+
+    d_type carries the shape: a dict is a menu of named choices, bool is a
+    switch, anything else is a number with a range.
+    """
+    d_type = ctrl.d_type
+    if isinstance(d_type, dict):
+        kind = "menu"
+        # For Auto Exposure Mode the camera answers GET_RES with a bitmap of the
+        # modes it actually implements rather than a step -- 9 means manual and
+        # aperture priority and nothing else.  Offering the other two would only
+        # produce a write the camera rejects.
+        supported = (ctrl.step
+                     if ctrl.display_name.strip() == "Auto Exposure Mode" else None)
+        options = [{"label": label, "value": value}
+                   for label, value in d_type.items()
+                   if not supported or value & supported]
+    elif d_type is bool:
+        kind, options = "bool", []
+    else:
+        kind, options = "int", []
+    mask = ctrl.info_bit_mask or 0
+    return {
+        # Two of the names pyuvc reports carry a trailing space ("Absolute
+        # Iris ").  Trim it here so it never reaches config.json or the UI;
+        # _control matches trimmed names, so nothing downstream needs to know.
+        "name": ctrl.display_name.strip(),
+        "kind": kind,
+        "options": options,
+        "value": ctrl.value,
+        "min": ctrl.min_val,
+        "max": ctrl.max_val,
+        "step": ctrl.step,
+        "default": ctrl.def_val,
+        "unit": ctrl.unit,
+        "doc": ctrl.doc or "",
+        "writable": bool(mask & INFO_SET),
+        # Reported as read-only for now: an automatic mode is driving it.
+        "auto_disabled": bool(mask & INFO_AUTO_DISABLED),
+    }
+
+
+def _apply_order(items):
+    """Automatic-mode switches first, then the values they would override.
+
+    Writing "Absolute Exposure Time" while auto exposure is on is rejected by
+    the camera, so the switch has to be settled before the value is restored.
+    """
+    return sorted(items, key=lambda kv: 0 if "Auto" in kv[0] else 1)
+
+
+@dataclass
+class _ControlRequest:
+    """A control read or write, queued for the capture thread to carry out."""
+    action: str                     # "list" | "set" | "reset"
+    name: str = ""
+    value: int = 0
+    refresh_all: bool = False       # re-read every control from the camera
+    done: threading.Event = field(default_factory=threading.Event)
+    result: object = None
+    error: str = ""
 
 
 @dataclass
@@ -62,7 +137,8 @@ class CameraWorker(threading.Thread):
 
     def __init__(self, cam_id: str, uid: str, role: str, side: str,
                  usb_path: str, product: str,
-                 width: int, height: int, fps: int, bandwidth_factor: float):
+                 width: int, height: int, fps: int, bandwidth_factor: float,
+                 controls: dict[str, int] | None = None):
         super().__init__(name=f"cam-{cam_id}", daemon=True)
         self.cam_id = cam_id
         self.uid = uid
@@ -88,6 +164,14 @@ class CameraWorker(threading.Thread):
         self._sink = None
         self._sink_lock = threading.Lock()
 
+        # Image controls the operator chose, written into the camera on every
+        # open because the camera forgets them whenever it loses power.
+        self.wanted_controls: dict[str, int] = dict(controls or {})
+        # Control transfers are done by this thread and no other.  Touching the
+        # capture handle from an HTTP thread would race the reopen path, which
+        # closes and replaces it, and libuvc gives no way to detect that.
+        self._requests: queue.Queue = queue.Queue()
+
     # -- preview ---------------------------------------------------------
 
     def latest_frame(self, after_seq: int, timeout: float = 5.0):
@@ -109,6 +193,163 @@ class CameraWorker(threading.Thread):
         with self._sink_lock:
             sink, self._sink = self._sink, None
         return sink
+
+    # -- image controls --------------------------------------------------
+
+    def list_controls(self, refresh_all: bool = False) -> list[dict]:
+        """Every control this camera exposes, with its current value.
+
+        `refresh_all` re-reads each one from the camera instead of reporting
+        what was cached.  It is the expensive path -- see _read_controls -- so
+        it happens only when someone explicitly asks for it.
+        """
+        return self._request(_ControlRequest("list", refresh_all=refresh_all))
+
+    def set_control(self, name: str, value: int) -> list[dict]:
+        """Write one control, remember it, and report every control again.
+
+        The whole list comes back because one control moves others: turning
+        auto exposure on makes the exposure time read-only, and the camera
+        clamps a value it does not like rather than refusing it.
+        """
+        return self._request(_ControlRequest("set", name=name, value=int(value)))
+
+    def reset_controls(self) -> list[dict]:
+        """Put every control back to the default the camera reports."""
+        return self._request(_ControlRequest("reset"))
+
+    def _request(self, req: _ControlRequest):
+        if not self.is_alive():
+            raise RuntimeError(f"{self.cam_id}: capture thread is not running")
+        self._requests.put(req)
+        if not req.done.wait(CONTROL_TIMEOUT):
+            raise TimeoutError(
+                f"{self.cam_id}: no answer within {CONTROL_TIMEOUT:.0f}s")
+        if req.error:
+            raise RuntimeError(req.error)
+        return req.result
+
+    def _serve_requests(self) -> None:
+        """Run queued control transfers.  Called from this thread only."""
+        while True:
+            try:
+                req = self._requests.get_nowait()
+            except queue.Empty:
+                return
+            try:
+                if self._cap is None:
+                    raise RuntimeError(
+                        f"{self.cam_id}: camera is not open "
+                        f"({self.stats.error or 'no signal'})")
+                # Under the same lock as opening and closing a camera: a
+                # control transfer must not overlap one, for the reason spelt
+                # out in _open.  Listing needs no transfer at all, so it costs
+                # nothing to hold the lock for it.
+                with _device_lock:
+                    if req.action == "set":
+                        self._write_control(req.name, req.value)
+                    elif req.action == "reset":
+                        self._reset_controls()
+                        self.wanted_controls.clear()
+                    # Only the control just written is read back, unless a
+                    # full re-read was asked for.
+                    req.result = self._read_controls(
+                        req.name if req.action == "set" else None,
+                        refresh_all=req.refresh_all)
+                if req.action == "set":
+                    # Remember what the camera settled on rather than what was
+                    # asked for: it clamps a value out of range, and the next
+                    # open has to write back the one that will actually stick.
+                    applied = next((c["value"] for c in req.result
+                                    if c["name"] == req.name), req.value)
+                    self.wanted_controls[req.name] = applied
+            except Exception as exc:
+                req.error = str(exc)
+            finally:
+                req.done.set()
+
+    def _fail_pending(self, reason: str) -> None:
+        """Release anyone waiting on a control once this thread is going away."""
+        while True:
+            try:
+                req = self._requests.get_nowait()
+            except queue.Empty:
+                return
+            req.error = f"{self.cam_id}: {reason}"
+            req.done.set()
+
+    def _read_controls(self, refresh: str | None = None,
+                       refresh_all: bool = False) -> list[dict]:
+        """Snapshot every control, re-reading at most the one just written.
+
+        Re-reading all of them is not affordable by default.  Each one is a USB
+        control transfer that pyuvc performs with the GIL held, and an eye
+        camera's twenty-odd controls measured 1.2 s end to end -- during which
+        every capture thread in the process stops and each camera loses a
+        second of frames.  So the values pyuvc read when the camera was opened
+        are kept and updated by our own writes, and only the control a write
+        just touched is read back, to learn what the camera clamped it to.
+
+        `refresh_all` pays that cost deliberately.  It is the only way to see a
+        value an automatic mode has moved on its own, or to correct one the
+        camera reported wrongly at open, so the operator can ask for it.
+        """
+        if refresh_all:
+            for ctrl in self._cap.controls:
+                self._refresh_one(ctrl)
+        elif refresh:
+            self._refresh_one(self._control(refresh))
+        return [describe_control(c) for c in self._cap.controls]
+
+    def _refresh_one(self, ctrl) -> None:
+        try:
+            ctrl.refresh()
+        except Exception as exc:
+            logger.debug("%s: %s could not be refreshed: %s",
+                         self.cam_id, ctrl.display_name.strip(), exc)
+
+    def _control(self, name: str):
+        wanted = name.strip()
+        for ctrl in self._cap.controls:
+            if ctrl.display_name.strip() == wanted:
+                return ctrl
+        raise RuntimeError(f"{self.cam_id}: no control named {name!r}")
+
+    def _write_control(self, name: str, value: int) -> None:
+        ctrl = self._control(name)
+        if not (ctrl.info_bit_mask or 0) & INFO_SET:
+            raise RuntimeError(f"{name} cannot be set on this camera")
+        ctrl.value = value
+
+    def _reset_controls(self) -> None:
+        defaults = [(c.display_name.strip(), c.def_val) for c in self._cap.controls
+                    if c.def_val is not None and (c.info_bit_mask or 0) & INFO_SET]
+        for name, value in _apply_order(defaults):
+            try:
+                self._control(name).value = value
+            except Exception as exc:
+                logger.warning("%s: could not reset %s: %s", self.cam_id, name, exc)
+
+    def _restore_controls(self, cap) -> None:
+        """Write the stored values into a freshly opened camera.
+
+        A control the camera does not have, or refuses, is logged and skipped:
+        losing one setting must not cost the whole stream.
+        """
+        if not self.wanted_controls:
+            return
+        by_name = {c.display_name.strip(): c for c in cap.controls}
+        for name, value in _apply_order(self.wanted_controls.items()):
+            ctrl = by_name.get(name)
+            if ctrl is None:
+                logger.warning("%s: no control named %r on this camera",
+                               self.cam_id, name)
+                continue
+            try:
+                ctrl.value = int(value)
+            except Exception as exc:
+                logger.warning("%s: could not restore %s=%s: %s",
+                               self.cam_id, name, value, exc)
 
     # -- lifecycle -------------------------------------------------------
 
@@ -163,6 +404,14 @@ class CameraWorker(threading.Thread):
                     raise RuntimeError(
                         f"{self.cam_id}: no first frame within "
                         f"{FIRST_FRAME_TIMEOUT:.0f}s") from None
+                # The camera came up with its factory values; put the
+                # operator's back before releasing the lock.  A control
+                # transfer takes ~100 ms on an eye camera and pyuvc holds the
+                # GIL for all of it, which is long enough to wedge another
+                # camera that is inside uvc.Capture() at the time: measured,
+                # one stored setting left a camera stuck mid-open and the whole
+                # recorder unresponsive until it was killed.
+                self._restore_controls(cap)
             except Exception:
                 cap.close()
                 raise
@@ -174,21 +423,56 @@ class CameraWorker(threading.Thread):
                     self.cam_id, self.width, self.height, self.fps,
                     self.uid, self.usb_path)
 
+    def _device_vanished(self) -> bool:
+        """True when the device this handle refers to is no longer on the bus.
+
+        A camera that was unplugged, or whose hub re-enumerated it, keeps its
+        USB port but is given a new address, so a uid that no longer matches
+        means the handle points at something that does not exist any more.
+        Reading this from sysfs touches no libuvc state and cannot block.
+        """
+        try:
+            return self._resolve_uid() != self.uid
+        except RuntimeError:
+            return True                 # nothing at that port at all
+        except Exception:
+            logger.exception("%s: could not tell whether the device is still there",
+                             self.cam_id)
+            return False                # unsure: close it the normal way
+
     def _close(self) -> None:
-        if self._cap is not None:
-            try:
-                with _device_lock:
-                    self._cap.close()
-            except Exception:
-                logger.exception("%s: error closing capture", self.cam_id)
-            self._cap = None
+        cap, self._cap = self._cap, None
         self.stats.connected = False
+        if cap is None:
+            return
+        if self._device_vanished():
+            # libuvc blocks inside close() on a handle whose device is gone,
+            # and it does so with the GIL held, which stops every thread in the
+            # process, HTTP included.  Measured: a headset whose hub
+            # re-enumerated left the recorder frozen and deaf to SIGTERM until
+            # systemd's 90 s stop timeout fired -- a six second USB dropout
+            # turned into a ninety second outage.  So the handle is abandoned
+            # instead.  It costs a file descriptor until the process exits, and
+            # the port is opened from scratch next time regardless.
+            logger.warning("%s: device at %s is gone (was uid %s); abandoning "
+                           "the handle rather than blocking on close",
+                           self.cam_id, self.usb_path, self.uid)
+            return
+        try:
+            with _device_lock:
+                cap.close()
+        except Exception:
+            logger.exception("%s: error closing capture", self.cam_id)
 
     def run(self) -> None:
         window_start = time.monotonic()
         window_frames = 0
 
         while not self._stop.is_set():
+            # Between frames is the only safe moment to talk to the camera's
+            # control endpoint, so queued reads and writes are served here.
+            self._serve_requests()
+
             if self._cap is None:
                 try:
                     self._open()
@@ -256,6 +540,7 @@ class CameraWorker(threading.Thread):
                 self._new_frame.notify_all()
 
         self._close()
+        self._fail_pending("camera stopped")
         logger.info("%s: stopped after %d frames", self.cam_id, self.stats.frames)
 
 
@@ -283,13 +568,15 @@ def build_workers(cfg) -> list[CameraWorker]:
         for cam in sorted(port_cams, key=lambda c: c.usb_path):
             seen[cam.role] = seen.get(cam.role, 0) + 1
             suffix = "" if seen[cam.role] == 1 else str(seen[cam.role])
+            cam_id = f"{side}_{cam.role}{suffix}"
             width, height, fps = cfg.mode_for(cam.role)
             workers.append(CameraWorker(
-                cam_id=f"{side}_{cam.role}{suffix}",
+                cam_id=cam_id,
                 uid=cam.uid, role=cam.role, side=side,
                 usb_path=cam.usb_path, product=cam.product,
                 width=width, height=height, fps=fps,
                 bandwidth_factor=cfg.bandwidth_factor,
+                controls=cfg.controls_for(cam_id),
             ))
     return sorted(workers, key=lambda w: (w.side, w.role, w.usb_path))
 

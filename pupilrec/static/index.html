@@ -18,6 +18,9 @@
     --ok: #3dd68c;
   }
   * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  /* Any rule that sets `display` outranks the browser's own [hidden] rule, so
+     a hidden .pill or .modal would otherwise still be on screen. */
+  [hidden] { display: none !important; }
   body {
     margin: 0; background: var(--bg); color: var(--text);
     font: 15px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
@@ -107,6 +110,58 @@
   .actions { display: flex; flex-wrap: wrap; gap: 10px; }
   button.ghost { background: var(--panel-2); border: 1px solid var(--line); font-weight: 500; padding: 11px 16px; }
   .hint { color: var(--muted); font-size: 12.5px; margin: 12px 0 0; max-width: 60ch; }
+  .hint.warn { color: var(--rec); }
+  /* --- camera settings modal --- */
+  button.gear {
+    background: none; border: 0; padding: 6px 10px; min-height: 0;
+    font-size: 16px; line-height: 1; color: var(--muted); border-radius: 8px;
+  }
+  button.gear:hover { color: var(--text); background: var(--panel-2); }
+  .modal {
+    position: fixed; inset: 0; z-index: 40; background: rgba(0,0,0,.62);
+    display: flex; align-items: center; justify-content: center; padding: 16px;
+  }
+  .sheet {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 16px;
+    width: min(920px, 100%); max-height: 92vh; display: flex; flex-direction: column;
+    overflow: hidden;
+  }
+  .sheetHead {
+    display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+    padding: 13px 16px; border-bottom: 1px solid var(--line);
+  }
+  .sheetHead .sub { color: var(--muted); font-size: 13px; }
+  /* overscroll-behavior keeps a flick inside the panel from scrolling the page
+     underneath it once the list hits its end. */
+  .sheetBody {
+    overflow-y: auto; overscroll-behavior: contain;
+    -webkit-overflow-scrolling: touch; padding: 16px;
+  }
+  body.modalOpen { overflow: hidden; }
+  .sheetBody figure { margin: 0 0 16px; background: #000; border-radius: 12px; overflow: hidden; }
+  #ctrlRecWarn { margin: 0 0 14px; max-width: none; }
+  .sheetBody figure img { display: block; width: 100%; max-height: 34vh; object-fit: contain; }
+  .grp { margin: 0 0 6px; font-size: 12px; text-transform: uppercase;
+         letter-spacing: .09em; color: var(--muted); }
+  .grp:not(:first-child) { margin-top: 20px; }
+  .ctrl { padding: 10px 0; border-bottom: 1px solid var(--line); }
+  .ctrl:last-child { border-bottom: 0; }
+  .ctrl .top { display: flex; align-items: baseline; gap: 9px; flex-wrap: wrap; }
+  .ctrl .label { font-weight: 600; }
+  .ctrl .val { margin-left: auto; font-variant-numeric: tabular-nums; color: var(--muted); }
+  .ctrl .note { flex-basis: 100%; color: var(--muted); font-size: 12.5px; margin-top: 3px; }
+  .ctrl .note.warn { color: #f0b429; }
+  .ctrl input[type=range] { width: 100%; margin-top: 9px; height: 34px; accent-color: var(--accent); }
+  .ctrl select { width: 100%; margin-top: 8px; }
+  .ctrl .sw { display: flex; align-items: center; gap: 10px; margin-top: 8px; }
+  .ctrl .sw input { width: 26px; height: 26px; accent-color: var(--accent); }
+  .badge {
+    font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .06em;
+    color: var(--muted); border: 1px solid var(--line); border-radius: 999px; padding: 2px 8px;
+  }
+  .ctrl.locked .label, .ctrl.locked .val { opacity: .55; }
+  #ctrlList.busy { opacity: .5; pointer-events: none; }
+
   #toast {
     position: fixed; left: 50%; bottom: 26px; transform: translateX(-50%);
     background: var(--panel-2); border: 1px solid var(--line); border-radius: 10px;
@@ -160,6 +215,27 @@
   <tbody id="recRows"></tbody></table>
 </section>
 
+<div class="modal" id="ctrlModal" hidden>
+  <div class="sheet" role="dialog" aria-modal="true" aria-labelledby="ctrlTitle">
+    <div class="sheetHead">
+      <strong id="ctrlTitle"></strong>
+      <span class="sub" id="ctrlSub"></span>
+      <span class="spacer"></span>
+      <button class="ghost" id="ctrlRefresh"
+              title="Minden érték újraolvasása a kamerából">Frissítés</button>
+      <button class="ghost" id="ctrlReset">Alaphelyzet</button>
+      <button class="ghost" id="ctrlClose">Bezár</button>
+    </div>
+    <div class="sheetBody">
+      <p class="hint warn" id="ctrlRecWarn" hidden>Felvétel közben vagy. Egy
+         beállítás írása a kamerába kb. 0,15 mp-re megakasztja az összes
+         kamerát, tehát néhány képkocka kiesik a felvételből.</p>
+      <figure><img id="ctrlImg" alt=""></figure>
+      <div id="ctrlList"></div>
+    </div>
+  </div>
+</div>
+
 <div id="toast"></div>
 
 <script>
@@ -209,6 +285,7 @@ let lastVersion = null;     // server state_version seen so far
 let lastRecording = null;
 let busy = false;           // a start/stop request is in flight
 let wakeLock = null;
+let cameras = [];           // last camera list from /api/status
 
 const $ = (id) => document.getElementById(id);
 
@@ -267,14 +344,29 @@ function eachImage(fn) {
 }
 
 function reattachAll() {
+  // While the settings modal is open it holds the only preview, so the grid
+  // stays dark: reviving four streams behind it would compete for USB and for
+  // the handful of connections a browser allows to one host.
+  if (ctrlCam) return attachStream($("ctrlImg"), ctrlCam);
   eachImage((img, id) => { img.dataset.mode = ""; attachStream(img, id); });
+}
+
+function stopAllStreams() {
+  eachImage(img => { img.dataset.mode = ""; img.onload = img.onerror = null;
+                     img.removeAttribute("src"); });
+}
+
+/* Every live preview: the grid, plus the settings modal when it is open. */
+function eachLiveImage(fn) {
+  eachImage(fn);
+  if (ctrlCam) fn($("ctrlImg"), ctrlCam);
 }
 
 /* Reconnect a single stream that stopped delivering while the page is online. */
 setInterval(() => {
   if (!online) return;
   const now = Date.now();
-  eachImage((img, id) => {
+  eachLiveImage((img, id) => {
     const perFrameLoads = Number(img.dataset.loads) > 2;
     const silent = now - Number(img.dataset.lastLoad) > STREAM_WATCHDOG_MS;
     if (img.dataset.mode === "stream" && perFrameLoads && silent) {
@@ -311,7 +403,9 @@ function build(cameras) {
           <span class="num" id="fps-${cam.id}">–</span>
           <span style="flex:1"></span>
           <span class="num" id="cnt-${cam.id}"></span>
+          <button class="gear" title="Kamera beállításai" data-cam="${cam.id}">⚙</button>
         </div>`;
+      div.querySelector(".gear").onclick = () => openControls(cam.id);
       cams.appendChild(div);
       attachStream(div.querySelector("img"), cam.id);
     });
@@ -335,7 +429,7 @@ function goOffline() {
   $("offline").hidden = false;
   $("offlineFor").textContent = `(${fmtDuration((Date.now() - offlineSince) / 1000)})`;
   $("recBtn").disabled = true;
-  eachImage(img => img.classList.add("stale"));
+  eachLiveImage(img => img.classList.add("stale"));
 }
 
 function goOnline() {
@@ -371,6 +465,7 @@ async function refresh() {
     `${st.cameras.filter(c => c.connected).length}/${st.cameras.length} kamera` +
     (viewers > 1 ? ` · ${viewers} néző` : "");
 
+  cameras = st.cameras;
   if (!built && st.cameras.length) build(st.cameras);
 
   // Announce changes another client made, but only once per change and never
@@ -409,6 +504,10 @@ async function refresh() {
   btn.textContent = st.recording ? "Felvétel leállítása" : "Felvétel indítása";
   btn.className = st.recording ? "rec" : "";
   $("recName").disabled = st.recording;
+
+  // Writing a control stops every capture thread for as long as the transfer
+  // takes, so during a recording the cost of turning a knob is spelt out.
+  $("ctrlRecWarn").hidden = !st.recording;
 
   // Keep the screen awake for whoever is watching a running recording.
   if (st.recording && !wakeLock) acquireWakeLock();
@@ -516,6 +615,245 @@ async function loadRecordings() {
     }).join("");
   } catch { /* listing is optional */ }
 }
+
+/* ---- camera settings -------------------------------------------------- */
+
+/* The camera reports its controls by their UVC names.  Those names are the
+   contract with the hardware, so they stay as they are on the wire and are
+   only translated on the way to the screen; a control with no translation is
+   shown under its own name rather than hidden. */
+const CTRL_NAMES = {
+  "Auto Exposure Mode": "Expozíció módja",
+  "Auto Exposure Priority": "Expozíció elsőbbsége",
+  "Absolute Exposure Time": "Expozíciós idő",
+  "Auto Focus": "Automatikus fókusz",
+  "Absolute Focus": "Fókusz",
+  "Absolute Iris": "Írisz",
+  "Scanning Mode": "Letapogatás",
+  "Zoom absolute control": "Zoom",
+  "Pan control": "Pásztázás",
+  "Tilt control": "Dőlés",
+  "Roll absolute control": "Forgatás",
+  "Privacy Shutter control": "Takarózár",
+  "Backlight Compensation": "Ellenfény-kompenzáció",
+  "Brightness": "Fényerő",
+  "Contrast": "Kontraszt",
+  "Gain": "Erősítés",
+  "Power Line frequency": "Hálózati frekvencia",
+  "Hue": "Színárnyalat",
+  "Saturation": "Telítettség",
+  "Sharpness": "Élesség",
+  "Gamma": "Gamma",
+  "White Balance temperature": "Fehéregyensúly",
+  "White Balance temperature blue": "Fehéregyensúly (kék)",
+  "White Balance temperature red": "Fehéregyensúly (piros)",
+  "White Balance temperature,Auto": "Automatikus fehéregyensúly",
+  "White Balance component,Auto": "Automatikus fehéregyensúly (komponens)",
+  "Digital Multiplier": "Digitális szorzó",
+  "Digital Multiplier limit control": "Digitális szorzó felső határa",
+  "Hue Auto control": "Automatikus színárnyalat",
+};
+const CTRL_OPTIONS = {
+  "manual mode": "kézi", "auto mode": "automatikus",
+  "shutter priority mode": "záridő-elsőbbség", "aperture priority mode": "rekesz-elsőbbség",
+  "Disabled": "kikapcsolva", "interlaced": "váltottsoros", "progessive": "progresszív",
+};
+const CTRL_GROUPS = {
+  input_terminal: "Expozíció és optika",
+  processing_unit: "Képminőség",
+};
+const ctrlName = (n) => CTRL_NAMES[n] || n;
+
+let ctrlCam = null;         // camera id whose modal is open, null when closed
+let ctrlPending = 0;        // writes still in flight
+let ctrlChain = Promise.resolve();
+
+/* Everything below the slider that is worth saying about a control: its unit,
+   and whether the value costs frame rate.  The recorder is built around a fixed
+   frame rate, so a setting that lets the camera drop below it is called out. */
+function ctrlNote(c, fps) {
+  if (c.name === "Absolute Exposure Time") {
+    const ms = c.value / 10;                       // UVC counts 0.0001 s units
+    const frameMs = fps ? 1000 / fps : 0;
+    const note = `${ms.toFixed(1)} ms`;
+    return frameMs && ms > frameMs
+      ? { text: `${note} — hosszabb, mint egy képkocka ideje (${frameMs.toFixed(1)} ms) `
+               + `${fps} fps mellett, ezért lassíthatja a kamerát`, warn: true }
+      : { text: note, warn: false };
+  }
+  if (c.name === "Auto Exposure Priority" && c.value)
+    return { text: "A kamera csökkentheti a képsebességet a jó expozícióért.", warn: true };
+  if (c.auto_disabled)
+    return { text: "Most egy automatika vezérli; kapcsold ki ahhoz, hogy hasson.", warn: false };
+  return null;
+}
+
+function ctrlRow(c, fps) {
+  const locked = !c.writable;
+  const note = ctrlNote(c, fps);
+  const badge = locked ? '<span class="badge">csak olvasható</span>'
+              : c.auto_disabled ? '<span class="badge">automata</span>' : "";
+  let input;
+  if (c.kind === "bool") {
+    input = `<label class="sw"><input type="checkbox" ${c.value ? "checked" : ""}
+             ${locked ? "disabled" : ""}> ${c.value ? "bekapcsolva" : "kikapcsolva"}</label>`;
+  } else if (c.kind === "menu") {
+    input = `<select ${locked ? "disabled" : ""}>` + c.options.map(o =>
+      `<option value="${o.value}" ${o.value === c.value ? "selected" : ""}>
+       ${CTRL_OPTIONS[o.label] || o.label}</option>`).join("") + "</select>";
+  } else {
+    // A camera that reports no range gives nothing to drag; show the number.
+    if (c.min === null || c.max === null || c.min >= c.max) return "";
+    input = `<input type="range" min="${c.min}" max="${c.max}" step="${c.step || 1}"
+             value="${c.value}" ${locked ? "disabled" : ""}>`;
+  }
+  const shown = c.kind === "int" ? `<span class="val">${c.value}</span>` : "";
+  return `<div class="ctrl ${locked ? "locked" : ""}" data-name="${c.name}" data-kind="${c.kind}">
+    <div class="top"><span class="label">${ctrlName(c.name)}</span>${badge}${shown}
+      ${note ? `<span class="note ${note.warn ? "warn" : ""}">${note.text}</span>` : ""}
+    </div>${input}</div>`;
+}
+
+function renderControls(controls) {
+  const fps = (cameras.find(c => c.id === ctrlCam) || {}).nominal_fps || 0;
+  const groups = {};
+  controls.forEach(c => (groups[c.unit] = groups[c.unit] || []).push(c));
+  const list = $("ctrlList");
+  list.innerHTML = Object.entries(groups).map(([unit, items]) =>
+    `<p class="grp">${CTRL_GROUPS[unit] || unit}</p>` +
+    items.map(c => ctrlRow(c, fps)).join("")).join("");
+
+  list.querySelectorAll(".ctrl").forEach(row => {
+    const name = row.dataset.name;
+    const input = row.querySelector("input, select");
+    if (!input || input.disabled) return;
+    if (row.dataset.kind === "int") {
+      // Dragging only moves the number; the camera is written once, on release,
+      // so a slow drag does not become a burst of USB control transfers.
+      input.oninput = () => { row.querySelector(".val").textContent = input.value; };
+      input.onchange = () => writeControl(name, Number(input.value));
+    } else if (row.dataset.kind === "bool") {
+      input.onchange = () => writeControl(name, input.checked ? 1 : 0);
+    } else {
+      input.onchange = () => writeControl(name, Number(input.value));
+    }
+  });
+}
+
+/* Writes are queued rather than sent in parallel: the camera serves one control
+   transfer at a time anyway, and each answer describes every control, so two in
+   flight would race to redraw the panel. */
+function writeControl(name, value) {
+  ctrlPending += 1;
+  $("ctrlList").classList.add("busy");
+  ctrlChain = ctrlChain.then(async () => {
+    const cam = ctrlCam;
+    try {
+      const res = await fetch(`/api/controls/${cam}`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name, value }),
+      });
+      const body = await res.json();
+      if (!res.ok) throw new Error(body.error || "sikertelen");
+      // Redraw only once the last write has landed, so the panel never shows a
+      // value that a still-pending write is about to change.
+      if (ctrlCam === cam && ctrlPending === 1) renderControls(body.controls);
+    } catch (e) {
+      toast(`${ctrlName(name)}: ${e.message}`, "error");
+      if (ctrlCam === cam && ctrlPending === 1) loadControls();
+    } finally {
+      ctrlPending -= 1;
+      if (ctrlPending === 0) $("ctrlList").classList.remove("busy");
+    }
+  });
+  return ctrlChain;
+}
+
+/* The panel shows what the camera reported when it was opened, updated by our
+   own writes -- re-reading everything costs about a second of every camera's
+   frames.  This asks for that re-read anyway, which is the only way to see a
+   value an automatic mode has moved, or to correct one the camera got wrong. */
+$("ctrlRefresh").onclick = async () => {
+  if (lastRecording && !confirm(
+      "A frissítés kb. 1 másodpercre megakasztja az összes kamerát, így " +
+      "felvétel közben képkockák esnek ki. Folytatod?")) return;
+  const btn = $("ctrlRefresh");
+  btn.disabled = true;
+  try {
+    if (await loadControls({ refresh: true }))
+      toast("Értékek beolvasva a kamerából");
+  } finally {
+    btn.disabled = false;
+  }
+};
+
+async function loadControls({ refresh = false } = {}) {
+  const cam = ctrlCam;
+  try {
+    const url = `/api/controls/${cam}` + (refresh ? "?refresh=1" : "");
+    const res = await fetch(url, { cache: "no-store" });
+    const body = await res.json();
+    if (!res.ok) throw new Error(body.error || "sikertelen");
+    if (ctrlCam !== cam) return false;          // modal closed or moved on
+    renderControls(body.controls);
+    return true;
+  } catch (e) {
+    if (ctrlCam === cam)
+      $("ctrlList").innerHTML = `<p class="hint warn">Nem sikerült lekérdezni: ${e.message}</p>`;
+    return false;
+  }
+}
+
+function openControls(id) {
+  const cam = cameras.find(c => c.id === id) || { id };
+  ctrlCam = id;
+  $("ctrlTitle").textContent = `${headsetLabel(cam.side)} — ${cameraLabel(cam)}`;
+  $("ctrlSub").textContent =
+    `${cam.product || ""} · ${cam.width}×${cam.height} @ ${cam.nominal_fps} fps`;
+  $("ctrlList").innerHTML = '<p class="hint">Betöltés…</p>';
+  $("ctrlRecWarn").hidden = !lastRecording;
+  $("ctrlModal").hidden = false;
+  document.body.classList.add("modalOpen");
+  // One camera at a time: the grid streams stop so this preview gets the bus.
+  stopAllStreams();
+  attachStream($("ctrlImg"), id);
+  loadControls();
+}
+
+function closeControls() {
+  ctrlCam = null;
+  const img = $("ctrlImg");
+  img.dataset.mode = "";
+  img.onload = img.onerror = null;
+  img.removeAttribute("src");
+  $("ctrlModal").hidden = true;
+  document.body.classList.remove("modalOpen");
+  reattachAll();
+}
+
+$("ctrlClose").onclick = closeControls;
+$("ctrlModal").onclick = (e) => { if (e.target.id === "ctrlModal") closeControls(); };
+document.addEventListener("keydown", (e) => { if (e.key === "Escape" && ctrlCam) closeControls(); });
+
+$("ctrlReset").onclick = async () => {
+  if (!confirm("Minden beállítás visszaáll a kamera gyári értékére. Folytatod?")) return;
+  const cam = ctrlCam;
+  $("ctrlReset").disabled = true;
+  try {
+    const res = await fetch(`/api/controls/${cam}`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ reset: true }),
+    });
+    const body = await res.json();
+    if (!res.ok) throw new Error(body.error || "sikertelen");
+    if (ctrlCam === cam) renderControls(body.controls);
+    toast("Alaphelyzet visszaállítva");
+  } catch (e) {
+    toast(e.message, "error");
+  } finally {
+    $("ctrlReset").disabled = false;
+  }
+};
 
 /* ---- commands --------------------------------------------------------- */
 

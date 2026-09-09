@@ -94,6 +94,69 @@ The preview is throttled (10 fps by default, selectable in the header) so that
 Wi-Fi never limits what gets recorded. **Recording always stores every captured
 frame** regardless of what the preview shows.
 
+## Camera settings
+
+The **⚙** next to any camera opens a panel for that one camera, showing every
+image control it exposes -- exposure and its mode, gain, brightness, contrast,
+gamma, sharpness, white balance, and whatever else that particular model has.
+The live preview of the camera being adjusted sits at the top of the panel, so
+a change is visible as it is made; the other previews pause while the panel is
+open, so one camera has the USB bus and the browser's connections to itself.
+
+Resolution and frame rate are deliberately **not** here. They are chosen per
+role in `config.json` (see `DEFAULT_MODES`) and changing one means restarting
+the stream, so they are not a knob to turn while recording. Two controls can
+still cost frame rate, and the panel says so where it can:
+
+* **Expozíció elsőbbsége** lets the camera drop below its nominal rate to
+  expose properly.
+* An **expozíciós idő** longer than one frame interval (16.7 ms at 60 fps)
+  cannot be delivered at that rate. The panel shows the time in milliseconds
+  and warns when it crosses the frame interval.
+
+The values live in the camera -- and only until it loses power, which happens
+on every replug and every reboot. So each change is also written to
+`camera_controls` in `config.json`, keyed by camera id, and written back into
+the camera every time it is opened. Pull a headset out and put it back and it
+comes up configured. **Alaphelyzet** puts one camera back to the defaults it
+reports and forgets its stored values.
+
+A control the camera refuses is reported and skipped, never retried into a
+failed open: losing one setting must not cost the stream. Controls the camera
+marks read-only, or that an automatic mode currently owns, are labelled as
+such rather than hidden.
+
+### Why the panel is careful
+
+Control transfers on these cameras are slow, and pyuvc performs them with the
+GIL held, so one of them stops **every** capture thread in the process, not
+just its own. Measured on a Pupil Cam2: ~50 ms to read a control and ~100 ms
+to write one; a Pupil Cam1 is roughly ten times quicker. Three consequences
+shape the code:
+
+* **Opening the panel costs nothing.** Re-reading a camera's twenty-odd
+  controls measured **1.2 s**, during which every camera fell to a few frames
+  per second. So the panel serves the values pyuvc read when the camera was
+  opened, updated by our own writes; only the control a write just touched is
+  read back, to learn what the camera clamped it to. **Frissítés** pays the
+  full 1.2 s deliberately and re-reads everything -- the way to see a value an
+  automatic mode has moved since the camera opened, or to correct one the
+  camera reported wrongly at open. (That happens: a Pupil Cam2 reported
+  `Backlight Compensation` as 121 on a control whose range is 0-3, and a
+  re-read gave 0.) During a recording the button asks first.
+* **Control transfers hold the same lock as opening a camera.** Without that,
+  restoring one stored setting at start-up was enough to wedge the recorder:
+  the write overlapped another camera's `uvc.Capture()`, and the process sat
+  with the GIL held, unresponsive, unkillable by SIGTERM, with three of four
+  cameras streaming. Reproducible, and gone once the two cannot overlap.
+* **Changing a setting mid-recording drops frames** -- about 0.15 s of them on
+  every camera. It is allowed, and the panel says so while a recording runs.
+
+Every transfer is carried out by that camera's own capture thread, between two
+frames. The HTTP thread queues the request and waits: touching the capture
+handle from another thread would race the reopen path, which closes and
+replaces it.
+
 ## Several clients, unreliable connections
 
 All state lives on the server. A client renders whatever `/api/status` reports
@@ -115,6 +178,9 @@ and never trusts its own view, which is what makes the following work:
   status poll greys out every tile and raises a banner, and streams are rebuilt
   on reconnect. Individual frozen streams are also detected and reattached,
   where the browser gives a per-frame signal to detect them with.
+* **A camera that cannot answer says so.** Asking a wedged or unplugged camera
+  for its settings returns an error to the panel within a few seconds instead
+  of hanging the request.
 * Stalled viewers are dropped server-side after 20 s rather than holding a
   thread until TCP gives up.
 
@@ -196,6 +262,7 @@ buttons. It refuses to restart anything mid-recording without a confirmation.
 | a camera drops its stream | the worker reopens it -- automatic |
 | the board stops responding | **Board tápciklizálása** power-cycles its USB port and restarts the daemon with it |
 | the recorder itself | **Kameraszerver újraindítása** |
+| a headset's USB hub re-enumerates | the cameras report "nincs jel"; a restart picks them back up |
 | the GNSS receiver is unplugged | logged as absent, picked up again on its own |
 
 The board's power cycle brought it back every time it was tried here, but it is
@@ -208,6 +275,27 @@ that is quietly missing half its data is the failure worth designing against.
 
 **Never `kill -9` the sensor daemon**: a process killed while the board streams
 wedges the board until someone presses its RESET button.
+
+### A camera that vanished is never closed
+
+`close()` on a libuvc handle whose device is gone does not fail -- it blocks,
+with the GIL held, which stops every thread in the process including the HTTP
+server. It was seen in the field: a headset's USB hub dropped off the bus and
+came back six seconds later with new device addresses, the operator pressed
+**Kameraszerver újraindítása**, and the shutdown stuck on the one camera whose
+handle was stale. The process ignored SIGTERM (a signal handler cannot run
+while C code holds the GIL) and only systemd's 90 s stop timeout ended it, so
+a six second dropout became a ninety second outage.
+
+So before closing, the worker asks sysfs whether the device is still there
+under the same uid -- a camera keeps its USB port across a replug but is given
+a new address. If it is gone, the handle is abandoned rather than closed. That
+leaks a file descriptor until the process exits, which is a bargain against
+freezing the recorder, and the port is opened from scratch next time anyway.
+
+`uvc.Capture()` can block exactly the same way while the recorder is
+*starting*, and there nothing inside the process can help: no Python code runs
+to notice it -- that one is still open.
 
 ## What a recording contains
 
