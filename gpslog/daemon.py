@@ -44,6 +44,40 @@ IDLE_PERIOD_S = 10.0
 # 0.1 Hz, which averages out to the right answer.
 LOG_RATE_WINDOW_S = 30.0
 
+# How far apart two messages in one read may claim to be before their iTOW
+# difference is treated as nonsense -- a week rollover, or a garbled field --
+# and the read's own time is used instead.
+MAX_BATCH_SPREAD_S = 5.0
+
+
+def host_times(fixes: list[dict], arrival: float,
+               max_spread_s: float = MAX_BATCH_SPREAD_S) -> list[tuple]:
+    """Give every message from one read its own arrival time.
+
+    A single read can hand back more than one message, and stamping them all
+    with the moment the read returned made consecutive rows share a timestamp:
+    measured on the rig, 99 gaps of 0.000 s alternating with 99 of 0.200 s,
+    while the receiver's own clock said every message was 0.100 s apart.
+
+    The receiver is the better clock here, so it is the one asked how far apart
+    the messages are.  The batch is spread backwards from its last message,
+    which is the one that had just arrived.  A row whose iTOW cannot be
+    trusted keeps the read's own time rather than a fabricated one.
+    """
+    if not fixes:
+        return []
+    last_itow = fixes[-1].get("itow_s")
+    out = []
+    for fix in fixes:
+        itow = fix.get("itow_s")
+        behind = 0.0
+        if last_itow is not None and itow is not None:
+            delta = last_itow - itow
+            if 0.0 <= delta <= max_spread_s:
+                behind = delta
+        out.append((fix, arrival - behind))
+    return out
+
 
 class GpsDaemon:
     def __init__(self, base_url: str, directory: str, period_ms: int = DEFAULT_PERIOD_MS,
@@ -180,15 +214,20 @@ class GpsDaemon:
                     reader = U.Reader()
 
                 try:
-                    data = self._serial.read(4096)
+                    # Block for the first byte of a chunk and take the time
+                    # right there, then sweep up whatever else is already
+                    # buffered.  read(4096) returned on the 0.2 s timeout
+                    # instead, so every row was stamped with the read cycle
+                    # rather than with when its message arrived.
+                    head = self._serial.read(1)
+                    arrival = time.time()
+                    data = head + self._serial.read(self._serial.in_waiting or 0)
                 except (serial.SerialException, OSError) as exc:
                     logger.warning("receiver went away: %s", exc)
                     self.last_error = str(exc)
                     self._close_device()
                     continue
 
-                now = time.time()
-                stamp = datetime.fromtimestamp(now)
                 # Ask where a recording is writing before handling this batch
                 # rather than after, so its very first rows are copied too --
                 # and so this batch is logged at the rate the recording wants.
@@ -196,12 +235,16 @@ class GpsDaemon:
                 recording = bool(self.copy.directory)
                 self.throttled = not recording
 
+                batch = []
                 for cls, msg, payload in reader.feed(data or b""):
                     if (cls, msg) != (U.CLS_NAV, U.MSG_PVT):
                         continue
                     fix = U.parse_pvt(payload)
-                    if fix is None:
-                        continue
+                    if fix is not None:
+                        batch.append(fix)
+
+                for fix, now in host_times(batch, arrival):
+                    stamp = datetime.fromtimestamp(now)
                     row = dict(fix, unix_time=f"{now:.3f}",
                                iso_time=stamp.isoformat(timespec="milliseconds"))
                     line = format_row(row)

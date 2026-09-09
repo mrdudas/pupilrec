@@ -9,7 +9,7 @@ nothing is being recorded -- without ever thinning what a recording gets.
 import unittest
 from unittest import mock
 
-from gpslog.daemon import IDLE_PERIOD_S, GpsDaemon
+from gpslog.daemon import IDLE_PERIOD_S, GpsDaemon, host_times
 
 
 def daemon(idle_period_s=IDLE_PERIOD_S):
@@ -97,6 +97,54 @@ class TransitionTest(unittest.TestCase):
             dog.keep_row(step / 10, {"fix": "3D"}, True)
         self.assertFalse(dog.keep_row(1.0, {"fix": "3D"}, False))
         self.assertTrue(dog.keep_row(11.0, {"fix": "3D"}, False))
+
+
+class HostTimeTest(unittest.TestCase):
+    """One read can carry several messages, and they did not all arrive at
+    once.  Measured before this: 99 host-time gaps of 0.000 s alternating with
+    99 of 0.200 s, while the receiver said every message was 0.100 s apart."""
+
+    @staticmethod
+    def times(itows, arrival=1000.0):
+        return [round(t, 4) for _, t in
+                host_times([{"itow_s": w} for w in itows], arrival)]
+
+    def test_one_message_keeps_the_arrival_time(self):
+        self.assertEqual(self.times([500.0]), [1000.0])
+
+    def test_two_messages_in_one_read_are_pulled_apart(self):
+        """The later one arrived now; the earlier one, 100 ms ago."""
+        self.assertEqual(self.times([500.0, 500.1]), [999.9, 1000.0])
+
+    def test_a_whole_batch_keeps_the_receiver_s_spacing(self):
+        self.assertEqual(self.times([500.0, 500.1, 500.2, 500.3]),
+                         [999.7, 999.8, 999.9, 1000.0])
+
+    def test_no_two_rows_share_a_timestamp(self):
+        stamps = self.times([500.0 + n / 10 for n in range(5)])
+        self.assertEqual(len(set(stamps)), 5)
+
+    def test_a_week_rollover_falls_back_to_the_read_time(self):
+        """iTOW restarts at the end of a GPS week; better a coarse time than
+        a row claiming to be from six days ago."""
+        self.assertEqual(self.times([604799.9, 0.0]), [1000.0, 1000.0])
+
+    def test_a_wildly_wrong_itow_falls_back(self):
+        self.assertEqual(self.times([100.0, 500.0]), [1000.0, 1000.0])
+
+    def test_a_missing_itow_falls_back(self):
+        fixes = [{"itow_s": None}, {"itow_s": 500.1}]
+        self.assertEqual([t for _, t in host_times(fixes, 1000.0)],
+                         [1000.0, 1000.0])
+
+    def test_an_empty_read_produces_nothing(self):
+        self.assertEqual(host_times([], 1000.0), [])
+
+    def test_the_fixes_come_back_untouched_and_in_order(self):
+        fixes = [{"itow_s": 500.0, "fix": "3D"}, {"itow_s": 500.1, "fix": "2D"}]
+        out = host_times(fixes, 1000.0)
+        self.assertEqual([f["fix"] for f, _ in out], ["3D", "2D"])
+        self.assertIs(out[0][0], fixes[0])
 
 
 if __name__ == "__main__":

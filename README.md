@@ -279,6 +279,34 @@ Rows are written even with no fix: indoors the receiver reports `fix=none` with
 no position, and logging that documents the gap rather than leaving a silent
 hole. Position columns fill in only once the receiver reports a valid fix.
 
+### Host time
+
+`unix_time` is what lines a GNSS row up against a camera frame or a sensor
+sample, so it is worth more than the convenient reading. Two things were wrong
+with it, both visible by comparing it against `itow_s`, the receiver's own
+clock, over one recording:
+
+```
+receiver:   every message 0.100 s apart, 250 of them
+host time:  0.000 s x99  alternating with  0.200 s x99
+```
+
+The read was `read(4096)` against a 0.2 s timeout, so it returned on the
+timeout rather than when a message arrived, and every message in it was
+stamped with that one moment. Half the rows were therefore up to 100 ms wrong
+and consecutive rows shared a timestamp.
+
+Now the read blocks for the first byte of a chunk and takes the time right
+there, and where a read still carries more than one message they are spread
+apart using the receiver's iTOW -- it is the better clock, so it is the one
+asked how far apart its own messages were. A row whose iTOW cannot be trusted,
+across a GPS week rollover for instance, keeps the read's own time rather than
+a fabricated one.
+
+The same measurement afterwards: gaps clustered on 0.100 s (±2 ms), no two
+rows sharing a timestamp, and host time tracking the receiver to within
+**1 ms** across the whole recording.
+
 **The receiver is optional.** With none attached the logger waits quietly and
 nothing else is affected; unplugging it mid-run is not an error and it is picked
 back up automatically, typically within five seconds. Recordings made without it
