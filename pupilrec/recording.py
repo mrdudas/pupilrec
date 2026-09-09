@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import queue
+import re
 import subprocess
 import threading
 import time
@@ -23,6 +24,42 @@ from datetime import datetime
 logger = logging.getLogger(__name__)
 
 CSV_HEADER = "frame_index,unix_time,iso_time,monotonic_time,device_time,uvc_index,jpeg_bytes\n"
+
+# A recording directory is "<date>_<time>" plus an optional label.  The stamp is
+# what orders the listing and ties the directory to the times inside it, so only
+# the label is ever the operator's to choose -- when starting a recording and
+# when renaming one later, by the same rule in both cases.
+STAMP_FORMAT = "%Y-%m-%d_%H-%M-%S"
+STAMP_PATTERN = re.compile(r"\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}")
+LABEL_MAX = 40
+
+
+def safe_label(name: str) -> str:
+    """The part of a directory name a person gets to pick, made safe.
+
+    Anything that could change what path this points at is dropped rather than
+    rejected: a name is a convenience, and refusing one mid-session would cost
+    a recording.
+    """
+    # Spaces become underscores rather than vanishing, so "két kamera" reads as
+    # "két_kamera" instead of "kétkamera".
+    collapsed = "_".join(name.split())
+    return "".join(c for c in collapsed if c.isalnum() or c in "-_")[:LABEL_MAX]
+
+
+def split_name(directory: str) -> tuple[str, str]:
+    """A recording directory name as (timestamp, label). -> ("", name) if odd."""
+    match = STAMP_PATTERN.match(directory)
+    if not match or match.start() != 0:
+        return "", directory
+    return match.group(), directory[match.end():].lstrip("_")
+
+
+def join_name(stamp: str, label: str) -> str:
+    label = safe_label(label)
+    if not stamp:
+        return label
+    return f"{stamp}_{label}" if label else stamp
 
 
 class CameraSink:
@@ -132,9 +169,7 @@ class RecordingSession:
     """One directory holding a synchronised set of recordings."""
 
     def __init__(self, root: str, workers, name: str = ""):
-        stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        safe = "".join(c for c in name if c.isalnum() or c in "-_")[:40]
-        self.name = f"{stamp}_{safe}" if safe else stamp
+        self.name = join_name(datetime.now().strftime(STAMP_FORMAT), name)
         self.directory = os.path.join(root, self.name)
         os.makedirs(self.directory, exist_ok=False)
 

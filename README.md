@@ -157,6 +157,34 @@ frames. The HTTP thread queues the request and waits: touching the capture
 handle from another thread would race the reopen path, which closes and
 replaces it.
 
+## Managing recordings
+
+The table under the previews lists what has been recorded, with its size, and
+each row can be renamed or deleted.
+
+**Renaming changes the label, not the timestamp.** A directory is
+`<date>_<time>` plus an optional label, and the stamp is what orders this table
+and what ties the directory to the times written inside it -- so the editor
+shows it as fixed context and only the label is typed. The same rule governs
+what a label may contain whether it is chosen at the start of a recording or
+years later: letters (accented ones included), digits, `-` and `_`, up to 40
+characters, spaces turned into underscores. `recording.json` carries its own
+copy of the name, which is rewritten to match; if that fails the rename still
+stands and says so, because moving the directory is the real change.
+
+**Deleting is irreversible and asks first**, naming the recording and its size,
+and reminding that the sensor CSVs and the GPS track inside go with it. It is
+logged. Neither operation will touch a recording that is still running.
+
+The names come from a browser, so they are checked rather than trusted: a name
+must be a single path component naming a directory that really sits in the
+recordings directory, resolved through `realpath` so a symlink planted there is
+not a way out either.
+
+The frames column shows the total and, in red, any camera that recorded
+**nothing** -- a recording quietly missing one camera is the failure worth
+catching, and it does not survive being one number among four.
+
 ## Several clients, unreliable connections
 
 All state lives on the server. A client renders whatever `/api/status` reports
@@ -262,8 +290,8 @@ buttons. It refuses to restart anything mid-recording without a confirmation.
 | a camera drops its stream | the worker reopens it -- automatic |
 | the board stops responding | **Board tápciklizálása** power-cycles its USB port and restarts the daemon with it |
 | the recorder itself | **Kameraszerver újraindítása** |
-| the recorder freezes inside libuvc | the systemd watchdog restarts it within 20 s -- automatic |
 | a headset's USB hub re-enumerates | the cameras report "nincs jel"; a restart picks them back up |
+| the recorder freezes inside libuvc | the systemd watchdog restarts it within 20 s -- automatic |
 | the GNSS receiver is unplugged | logged as absent, picked up again on its own |
 
 The board's power cycle brought it back every time it was tried here, but it is

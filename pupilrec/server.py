@@ -26,7 +26,7 @@ import subprocess
 
 from .gpstrack import TrackStore
 from .tiles import TileCache
-from .recording import RecordingSession
+from .recording import RecordingSession, join_name, split_name
 
 logger = logging.getLogger(__name__)
 
@@ -123,6 +123,61 @@ class AppState:
              "port": cam.root_port}
             for cam in attached if cam.usb_path not in known
         ]
+
+    def recording_path(self, name: str) -> str:
+        """The directory of one stored recording, or a refusal.
+
+        The name arrives from a client, so it is checked rather than trusted:
+        it has to be a single path component naming a directory that really
+        sits in the recordings directory.  realpath closes the last hole, a
+        symlink there pointing somewhere else entirely.
+        """
+        if not name or name != os.path.basename(name) or name in (".", ".."):
+            raise LookupError(f"Not a recording name: {name!r}")
+        root = os.path.realpath(self.cfg.recordings_dir)
+        path = os.path.realpath(os.path.join(root, name))
+        if os.path.dirname(path) != root or not os.path.isdir(path):
+            raise LookupError(f"No such recording: {name}")
+        return path
+
+    def _refuse_if_running(self, name: str) -> None:
+        if self.session is not None and self.session.name == name:
+            raise ValueError(
+                "This recording is still running. Stop it first.")
+
+    def rename_recording(self, name: str, label: str) -> dict:
+        """Change the label of a stored recording, keeping its timestamp.
+
+        Only the label moves.  The timestamp is what orders the listing and
+        what ties the directory to the times written inside it, so it is not
+        the operator's to overwrite by accident.
+        """
+        with self.lock:
+            self._refuse_if_running(name)
+            path = self.recording_path(name)
+            stamp, _ = split_name(name)
+            new_name = join_name(stamp, label)
+            if not new_name:
+                raise ValueError("A recording needs a name.")
+            target = os.path.join(os.path.dirname(path), new_name)
+            if new_name != name and os.path.exists(target):
+                raise ValueError(f"There is already a recording called {new_name}.")
+            if new_name != name:
+                os.rename(path, target)
+        logger.info("recording renamed: %s -> %s", name, new_name)
+        return {"name": new_name, "was": name,
+                "metadata_updated": _rewrite_meta_name(target, new_name)}
+
+    def delete_recording(self, name: str) -> dict:
+        with self.lock:
+            self._refuse_if_running(name)
+            path = self.recording_path(name)
+            freed = _directory_bytes(path)
+            shutil.rmtree(path)
+        logger.warning("recording deleted: %s (%d bytes)", name, freed)
+        if self.last_result and self.last_result.get("name") == name:
+            self.last_result = None     # do not report a recording that is gone
+        return {"name": name, "freed_bytes": freed}
 
     def camera_controls(self, cam_id: str, refresh: bool = False) -> dict:
         """Every image control of one camera.
@@ -228,6 +283,39 @@ class AppState:
             "last_result": self.last_result,
             "server_time": time.time(),
         }
+
+
+def _directory_bytes(path: str) -> int:
+    """Bytes held by one recording.  Flat by construction, so one level does."""
+    total = 0
+    try:
+        with os.scandir(path) as entries:
+            for entry in entries:
+                if entry.is_file(follow_symlinks=False):
+                    total += entry.stat(follow_symlinks=False).st_size
+    except OSError:
+        logger.exception("could not measure %s", path)
+    return total
+
+
+def _rewrite_meta_name(path: str, new_name: str) -> bool:
+    """Keep recording.json's own idea of its name in step with the directory.
+
+    Best effort: the rename has already happened and is the real change, so a
+    metadata file that cannot be updated is reported, not rolled back.
+    """
+    meta_path = os.path.join(path, "recording.json")
+    try:
+        with open(meta_path) as fh:
+            meta = json.load(fh)
+        meta["name"] = new_name
+        with open(meta_path, "w") as fh:
+            json.dump(meta, fh, indent=2)
+            fh.write("\n")
+        return True
+    except (OSError, json.JSONDecodeError):
+        logger.warning("renamed the directory but could not update %s", meta_path)
+        return False
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -373,6 +461,8 @@ class Handler(BaseHTTPRequestHandler):
             if url.path.startswith("/api/controls/"):
                 return self._set_control(
                     url.path[len("/api/controls/"):], payload)
+            if url.path in ("/api/recordings/rename", "/api/recordings/delete"):
+                return self._edit_recording(url.path.rsplit("/", 1)[-1], payload)
         except AlreadyRecording as exc:
             # Two clients pressed start at once.  The loser is not in error --
             # it just needs to know a recording is running and who owns it.
@@ -388,6 +478,25 @@ class Handler(BaseHTTPRequestHandler):
             logger.exception("request failed")
             return self._error(str(exc), HTTPStatus.INTERNAL_SERVER_ERROR)
         return self._error("Not found", HTTPStatus.NOT_FOUND)
+
+    # -- stored recordings -------------------------------------------------
+
+    def _edit_recording(self, action: str, payload):
+        name = str(payload.get("name", ""))
+        try:
+            if action == "rename":
+                return self._send_json(self.state.rename_recording(
+                    name, str(payload.get("label", ""))))
+            return self._send_json(self.state.delete_recording(name))
+        except LookupError as exc:
+            # Already gone, or never existed -- another client may have got
+            # there first, which is not this one's fault.
+            return self._error(str(exc), HTTPStatus.NOT_FOUND)
+        except ValueError as exc:
+            return self._error(str(exc), HTTPStatus.CONFLICT)
+        except OSError as exc:
+            return self._error(f"Could not {action} it: {exc}",
+                               HTTPStatus.INTERNAL_SERVER_ERROR)
 
     # -- image controls ---------------------------------------------------
 
@@ -564,9 +673,16 @@ class Handler(BaseHTTPRequestHandler):
         out = []
         if not os.path.isdir(root):
             return out
+        running = self.state.session.name if self.state.session else None
         for entry in sorted(os.listdir(root), reverse=True)[:50]:
-            meta_path = os.path.join(root, entry, "recording.json")
-            item = {"name": entry, "complete": False}
+            directory = os.path.join(root, entry)
+            if not os.path.isdir(directory):
+                continue
+            meta_path = os.path.join(directory, "recording.json")
+            stamp, label = split_name(entry)
+            item = {"name": entry, "complete": False, "label": label,
+                    "stamp": stamp, "running": entry == running,
+                    "bytes": _directory_bytes(directory)}
             try:
                 with open(meta_path) as fh:
                     meta = json.load(fh)

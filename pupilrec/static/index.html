@@ -162,6 +162,35 @@
   .ctrl.locked .label, .ctrl.locked .val { opacity: .55; }
   #ctrlList.busy { opacity: .5; pointer-events: none; }
 
+  /* --- recordings table --- */
+  /* Wide enough for both buttons: squeezing this column to its 1% ideal makes
+     the browser stack them, because the frames column claims the slack first. */
+  td.actions { text-align: right; white-space: nowrap; min-width: 160px; }
+  #recordings td:nth-child(5) { max-width: 22ch; }
+  button.mini {
+    background: var(--panel-2); border: 1px solid var(--line); color: var(--muted);
+    font-size: 12.5px; font-weight: 500; padding: 6px 11px; min-height: 34px;
+    border-radius: 8px; margin-left: 6px;
+  }
+  button.mini:hover:not(:disabled) { color: var(--text); }
+  button.mini.danger { border-color: #6d3034; color: #f2989b; }
+  button.mini.danger:hover:not(:disabled) { background: #3a2326; color: #ffd7d8; }
+  tr.editing td { background: var(--panel); }
+  td.name input {
+    font: inherit; color: var(--text); background: var(--panel-2);
+    border: 1px solid var(--accent); border-radius: 8px; padding: 6px 9px;
+    min-height: 34px; width: 100%; max-width: 260px;
+  }
+  td.name .stamp { color: var(--muted); }
+  .running-tag {
+    font-size: 11px; text-transform: uppercase; letter-spacing: .06em;
+    color: var(--rec); border: 1px solid var(--rec); border-radius: 999px;
+    padding: 1px 7px; margin-left: 8px;
+  }
+  @media (max-width: 720px) {
+    #recordings th:nth-child(2), #recordings td:nth-child(2) { display: none; }
+  }
+
   #toast {
     position: fixed; left: 50%; bottom: 26px; transform: translateX(-50%);
     background: var(--panel-2); border: 1px solid var(--line); border-radius: 10px;
@@ -211,7 +240,8 @@
 
 <section id="recordings">
   <h2>Korábbi felvételek</h2>
-  <table><thead><tr><th>Név</th><th>Kezdés</th><th class="num">Hossz</th><th>Képkockák</th></tr></thead>
+  <table><thead><tr><th>Név</th><th>Kezdés</th><th class="num">Hossz</th>
+    <th class="num">Méret</th><th>Képkockák</th><th></th></tr></thead>
   <tbody id="recRows"></tbody></table>
 </section>
 
@@ -604,15 +634,141 @@ document.querySelectorAll("[data-restart]").forEach(btn => {
   };
 });
 
-async function loadRecordings() {
+function fmtBytes(n) {
+  if (!n) return "—";
+  const unit = ["B", "kB", "MB", "GB", "TB"];
+  let i = 0;
+  while (n >= 1024 && i < unit.length - 1) { n /= 1024; i++; }
+  return `${n < 10 && i > 0 ? n.toFixed(1) : Math.round(n)} ${unit[i]}`;
+}
+
+/* Escaped, because a recording label is typed by a person and lands in HTML.
+   The server only allows letters, digits, "-" and "_" through, but the table
+   must not depend on the server's filter to stay safe. */
+function esc(text) {
+  return String(text).replace(/[&<>"']/g, c => (
+    { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+let recordings = [];
+
+/* Four raw per-camera counts are a poor thing to scan.  What matters is the
+   total, and whether any camera contributed nothing -- a recording that is
+   quietly missing a camera is the failure worth catching here, so it is called
+   out in red instead of left to be spotted among the numbers. */
+function framesCell(r) {
+  const entries = Object.entries(r.frames || {});
+  if (!entries.length) return '<td class="num">—</td>';
+  const total = entries.reduce((sum, [, n]) => sum + n, 0);
+  const empty = entries.filter(([, n]) => !n).map(([id]) => id);
+  const detail = entries.map(([id, n]) => `${id}: ${n}`).join("\n");
+  const text = empty.length
+    ? `${total.toLocaleString("hu")} — ${empty.join(", ")} üres`
+    : `${total.toLocaleString("hu")} kép · ${entries.length} kamera`;
+  return `<td class="num${empty.length ? " warn" : ""}" title="${esc(detail)}">${text}</td>`;
+}
+
+function recordingRow(r) {
+  const length = r.duration_s != null ? fmtDuration(r.duration_s)
+               : (r.complete ? "—" : "folyamatban");
+  const tag = r.running ? '<span class="running-tag">felvétel</span>' : "";
+  const buttons = r.running ? "" : `
+    <button class="mini" data-rename="${esc(r.name)}">Átnevezés</button>
+    <button class="mini danger" data-delete="${esc(r.name)}">Törlés</button>`;
+  return `<tr data-name="${esc(r.name)}">
+      <td class="name">${esc(r.name)}${tag}</td>
+      <td>${esc((r.started_iso || "").replace("T", " ").slice(0, 19))}</td>
+      <td class="num">${length}</td>
+      <td class="num">${fmtBytes(r.bytes)}</td>
+      ${framesCell(r)}
+      <td class="actions">${buttons}</td>
+    </tr>`;
+}
+
+/* Turns the name cell into an input.  Only the label is editable: the
+   timestamp is what orders this table and what ties the directory to the times
+   recorded inside it, so it is shown but not up for editing. */
+function editRow(name) {
+  renderRecordings();          // close any other row already being edited
+  const r = recordings.find(x => x.name === name);
+  const row = document.querySelector(`#recRows tr[data-name="${CSS.escape(name)}"]`);
+  if (!r || !row) return;
+  row.classList.add("editing");
+  const cell = row.querySelector("td.name");
+  cell.innerHTML = `<span class="stamp">${esc(r.stamp)}${r.stamp ? "_" : ""}</span>
+    <input type="text" maxlength="40" placeholder="név">`;
+  row.querySelector("td.actions").innerHTML = `
+    <button class="mini" data-save="${esc(name)}">Mentés</button>
+    <button class="mini" data-cancel="1">Mégse</button>`;
+  const input = cell.querySelector("input");
+  input.value = r.label;
+  input.focus();
+  input.select();
+  input.onkeydown = (e) => {
+    if (e.key === "Enter") saveName(name, input.value);
+    if (e.key === "Escape") renderRecordings();
+  };
+}
+
+async function saveName(name, label) {
   try {
-    const { recordings } = await (await fetch("/api/recordings", { cache: "no-store" })).json();
-    $("recRows").innerHTML = recordings.map(r => {
-      const frames = r.frames ? Object.entries(r.frames).map(([k, v]) => `${k}: ${v}`).join(", ") : "—";
-      return `<tr><td>${r.name}</td><td>${(r.started_iso || "").replace("T", " ").slice(0, 19)}</td>
-              <td class="num">${r.duration_s != null ? fmtDuration(r.duration_s) : (r.complete ? "—" : "folyamatban")}</td>
-              <td>${frames}</td></tr>`;
-    }).join("");
+    const res = await fetch("/api/recordings/rename", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name, label }),
+    });
+    const body = await res.json();
+    if (!res.ok) throw new Error(body.error || "sikertelen");
+    toast(body.name === body.was ? "A név nem változott" : `Új név: ${body.name}`);
+    if (body.metadata_updated === false)
+      toast("A mappa átnevezve, de a recording.json-t nem sikerült frissíteni", "error");
+  } catch (e) {
+    toast(e.message, "error");
+  }
+  loadRecordings(true);
+}
+
+async function removeRecording(name) {
+  const r = recordings.find(x => x.name === name) || {};
+  if (!confirm(`Törlöd véglegesen?\n\n${name}\n`
+      + `${fmtBytes(r.bytes)}${r.duration_s != null ? ", " + fmtDuration(r.duration_s) : ""}\n\n`
+      + "A videók, a szenzoradat és a GPS-nyom is elvész. Ez nem vonható vissza."))
+    return;
+  try {
+    const res = await fetch("/api/recordings/delete", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name }),
+    });
+    const body = await res.json();
+    if (!res.ok) throw new Error(body.error || "sikertelen");
+    toast(`Törölve: ${body.name} (${fmtBytes(body.freed_bytes)} felszabadult)`);
+  } catch (e) {
+    toast(e.message, "error");
+  }
+  loadRecordings(true);
+}
+
+$("recRows").onclick = (e) => {
+  const btn = e.target.closest("button");
+  if (!btn) return;
+  if (btn.dataset.rename) editRow(btn.dataset.rename);
+  else if (btn.dataset.delete) removeRecording(btn.dataset.delete);
+  else if (btn.dataset.save) saveName(btn.dataset.save,
+                                      btn.closest("tr").querySelector("input").value);
+  else if (btn.dataset.cancel) renderRecordings();
+};
+
+function renderRecordings() {
+  $("recRows").innerHTML = recordings.map(recordingRow).join("");
+}
+
+async function loadRecordings(force = false) {
+  // A background refresh must never redraw the table out from under someone
+  // renaming a row; an explicit one (saved, cancelled, deleted) always may.
+  if (!force && document.querySelector("#recRows tr.editing")) return;
+  try {
+    const body = await (await fetch("/api/recordings", { cache: "no-store" })).json();
+    recordings = body.recordings;
+    renderRecordings();
   } catch { /* listing is optional */ }
 }
 
