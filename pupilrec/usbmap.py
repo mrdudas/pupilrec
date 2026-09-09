@@ -49,6 +49,37 @@ def role_of(product: str) -> str | None:
     return None
 
 
+def discover_sysfs() -> list[UsbCam]:
+    """The attached Pupil cameras, read straight from sysfs.
+
+    Everything needed is there, including libuvc's uid, which is just
+    "busnum:devnum".  That matters: enumerating through libuvc while cameras are
+    streaming can block inside the library without releasing the GIL, freezing
+    the whole process.  Nothing here touches libuvc, so it is safe to call at
+    any time, including from a background thread while recording.
+    """
+    cams = []
+    for path in glob.glob("/sys/bus/usb/devices/*"):
+        name = os.path.basename(path)
+        if ":" in name or "-" not in name:      # interfaces and root hubs
+            continue
+        try:
+            with open(os.path.join(path, "product")) as fh:
+                product = fh.read().strip()
+            with open(os.path.join(path, "busnum")) as fh:
+                bus = int(fh.read())
+            with open(os.path.join(path, "devnum")) as fh:
+                dev = int(fh.read())
+        except (OSError, ValueError):
+            continue
+        role = role_of(product)
+        if role is None:
+            continue
+        cams.append(UsbCam(uid=f"{bus}:{dev}", product=product, usb_path=name,
+                           root_port=name.split(".")[0], role=role))
+    return sorted(cams, key=lambda c: (c.root_port, c.usb_path))
+
+
 def discover(device_list) -> list[UsbCam]:
     """Annotate a libuvc device list with physical port information.
 

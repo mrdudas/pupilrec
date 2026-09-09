@@ -63,6 +63,10 @@
     border-bottom: 1px solid var(--line);
   }
   .cams { display: grid; grid-template-columns: 3fr 1fr; gap: 1px; background: var(--line); }
+  /* A headset with two eye cameras: the world view keeps its width, the eye
+     views share the remaining column. */
+  .cams.eyes-2 { grid-template-columns: 3fr 1fr 1fr; }
+  .cams.eyes-3 { grid-template-columns: 3fr 1fr 1fr 1fr; }
   @media (max-width: 720px) { .cams { grid-template-columns: 1fr; } }
   .cam { background: var(--panel); display: flex; flex-direction: column; }
   .cam figure { margin: 0; background: #000; aspect-ratio: 16 / 9; display: grid; place-items: center; }
@@ -166,6 +170,21 @@
 
 const LABELS = { left: "Bal oldali port", right: "Jobb oldali port" };
 const ROLES  = { world: "Főkamera", eye: "Szemkamera" };
+
+// Headsets beyond the first two have no side, so they are numbered. Any label
+// set by hand in config.json is shown as it is.
+function headsetLabel(side) {
+  if (LABELS[side]) return LABELS[side];
+  const numbered = /^unit(\d+)$/.exec(side);
+  return numbered ? `${numbered[1]}. port` : side;
+}
+
+// A headset can carry more than one camera of a role: left_eye2, left_world2.
+function cameraLabel(cam) {
+  const base = ROLES[cam.role] || cam.role;
+  const extra = /(\d+)$/.exec(cam.id);
+  return extra ? `${base} ${extra[1]}` : base;
+}
 
 const POLL_MS = 1000;
 const STALE_AFTER_MS = 4000;      // no successful poll for this long => show as offline
@@ -276,8 +295,10 @@ function build(cameras) {
   Object.keys(bySide).sort().forEach(side => {
     const section = document.createElement("section");
     section.className = "headset";
-    section.innerHTML = `<h2>${LABELS[side] || side}</h2><div class="cams"></div>`;
+    section.innerHTML = `<h2>${headsetLabel(side)}</h2><div class="cams"></div>`;
     const cams = section.querySelector(".cams");
+    const eyeCount = bySide[side].filter(c => c.role === "eye").length;
+    if (eyeCount > 1) cams.classList.add(`eyes-${Math.min(eyeCount, 3)}`);
 
     bySide[side].sort((a, b) => a.role === "world" ? -1 : 1).forEach(cam => {
       const div = document.createElement("div");
@@ -285,7 +306,7 @@ function build(cameras) {
       div.innerHTML = `
         <figure><img alt="${cam.id}" id="img-${cam.id}"></figure>
         <div class="meta">
-          <span class="name">${ROLES[cam.role] || cam.role}</span>
+          <span class="name">${cameraLabel(cam)}</span>
           <span>${cam.width}×${cam.height}</span>
           <span class="num" id="fps-${cam.id}">–</span>
           <span style="flex:1"></span>
@@ -430,6 +451,14 @@ async function loadHealth() {
   if (s.last_error) chips.push(chip(false, s.last_error.slice(0, 60)));
   const lost = Object.values(s.lost_bytes || {}).reduce((a, b) => a + b, 0);
   if (lost > 0) chips.push(chip(false, `${lost} bájt szenzoradat elveszett`));
+  // A camera plugged in after start-up cannot be taken over without a restart:
+  // opening one while the others stream locks up the capture library.
+  (h.pending_cameras || []).forEach(c =>
+    chips.push(chip(false,
+      `Új kamera a(z) ${c.port} porton (${c.product}) — újraindítás kell hozzá`)));
+  (h.disconnected_cameras || []).forEach(id =>
+    chips.push(chip(false, `${id}: nincs jel`)));
+
   // The GNSS receiver is optional, so "not attached" is neutral, not an alarm.
   const g = h.gps || {};
   if (!g.running || !g.connected) {

@@ -14,7 +14,7 @@ import signal
 import sys
 import threading
 
-from pupilrec.capture import build_workers
+from pupilrec.capture import CameraSupervisor, build_workers
 from pupilrec.config import Config
 from pupilrec.server import local_addresses, serve
 
@@ -81,6 +81,12 @@ def main() -> int:
         worker.start()
 
     httpd, state = serve(cfg, workers)
+
+    # Headsets are optional and may be plugged in later.  The supervisor cannot
+    # start such a camera itself, but it can say one is waiting.
+    supervisor = CameraSupervisor(
+        cfg, state.note_attached, lambda: state.session is not None)
+    supervisor.start()
     print(f"\n  {len(workers)} cameras streaming. Open on the iPad:")
     for url in local_addresses(cfg.port):
         print(f"    {url}")
@@ -101,12 +107,15 @@ def main() -> int:
     try:
         httpd.serve_forever()
     finally:
+        supervisor.stop()
         if state.session is not None:
             logging.info("finalising the running recording")
             state.stop_recording()
-        for worker in workers:
+        # state.workers, not the startup list: it may have grown since.
+        running = list(state.workers.values())
+        for worker in running:
             worker.stop()
-        for worker in workers:
+        for worker in running:
             worker.join(timeout=5)
         httpd.server_close()
     return 0

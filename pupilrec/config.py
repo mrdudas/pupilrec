@@ -59,10 +59,24 @@ class Config:
         return int(w), int(h), int(fps)
 
     def side_for(self, root_port: str, fallback_index: int) -> str:
-        """Label for a headset, assigning a stable default the first time."""
+        """Label for a headset, assigning a stable default the first time.
+
+        Two headsets get "left" and "right"; further ones are numbered, because
+        a third front port has no side to be on.  Any of them can be renamed in
+        config.json -- the label is what names the files.
+        """
         if root_port in self.headsets:
             return self.headsets[root_port]
-        side = "left" if fallback_index == 0 else "right"
+        default = ("left", "right")
+        side = (default[fallback_index] if fallback_index < len(default)
+                else f"unit{fallback_index + 1}")
+        # Never hand out a label already taken by another port.
+        taken = set(self.headsets.values())
+        if side in taken:
+            n = fallback_index + 1
+            while f"unit{n}" in taken:
+                n += 1
+            side = f"unit{n}"
         self.headsets[root_port] = side
         return side
 

@@ -91,6 +91,8 @@ class AppState:
         self.viewers_lock = threading.Lock()
 
         self.tracks = TrackStore(cfg.gps_dir)
+        # Cameras attached since start-up, which need a restart to be used.
+        self.pending_cameras: list[dict] = []
         self.tiles = TileCache(cfg.tiles_dir)
 
     @contextlib.contextmanager
@@ -104,6 +106,19 @@ class AppState:
                 self.viewers[cam_id] -= 1
                 if self.viewers[cam_id] <= 0:
                     del self.viewers[cam_id]
+
+    def note_attached(self, attached) -> None:
+        """Record which cameras are plugged in but not part of this session.
+
+        Opening one now would freeze the process (see CameraSupervisor), so a
+        newly attached camera is only reported; a restart picks it up.
+        """
+        known = {w.usb_path for w in self.workers.values()}
+        self.pending_cameras = [
+            {"usb_path": cam.usb_path, "product": cam.product, "role": cam.role,
+             "port": cam.root_port}
+            for cam in attached if cam.usb_path not in known
+        ]
 
     def start_recording(self, name: str, client: str = "") -> dict:
         with self.lock:
@@ -417,6 +432,8 @@ class Handler(BaseHTTPRequestHandler):
                 "pupilrec-sensors": self._service_state("pupilrec-sensors.service"),
                 "pupilrec-gps": self._service_state("pupilrec-gps.service"),
             },
+            "pending_cameras": self.state.pending_cameras,
+            "disconnected_cameras": [c["id"] for c in cameras if not c["connected"]],
             "tiles": self.state.tiles.stats(),
             "recovery_available": os.access(RECOVER_HELPER, os.X_OK),
             "recording": self.state.status()["recording"],
@@ -438,6 +455,17 @@ class Handler(BaseHTTPRequestHandler):
                 {"error": "A recording is running. Stop it first, or confirm to "
                           "restart anyway and lose it.",
                  "needs_force": True}, HTTPStatus.CONFLICT)
+        if target == "server":
+            # Restarting the recorder kills the process answering this request,
+            # so the reply has to go out first; otherwise a restart that worked
+            # is reported to the operator as a failure.
+            self._send_json({"target": target, "what": RECOVER_TARGETS[target],
+                             "output": "restarting"})
+            logger.warning("restart requested from %s", self.address_string())
+            threading.Timer(0.5, subprocess.call,
+                            args=(["sudo", "-n", RECOVER_HELPER, target],)).start()
+            return None
+
         try:
             done = subprocess.run(["sudo", "-n", RECOVER_HELPER, target],
                                   capture_output=True, text=True, timeout=60)

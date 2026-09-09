@@ -27,6 +27,31 @@ The first run assigns the lower-numbered port to `left` and stores it in
 ./run.py --swap-sides
 ```
 
+## More than two headsets
+
+Headsets and their cameras are optional and discovered at start-up. Two get the
+labels `left` and `right`; further ones are numbered (`unit3`), and any label
+can be changed in `config.json` -- the label is what names the files. A headset
+carrying more than one eye camera gets `left_eye`, `left_eye2`, numbered in USB
+port order, so the names existing recordings use never move.
+
+`tests/test_camera_naming.py` covers three headsets, two eye cameras on one
+headset and a single headset, all against synthetic device lists:
+
+```sh
+./.venv/bin/python -m unittest discover -s tests
+```
+
+**A camera plugged in while the system runs needs a restart to be used.** The UI
+says so when it detects one, and the restart button applies it. This is not
+laziness: pyuvc enumerates devices inside both `uvc.device_list()` and the
+`Capture` constructor, and those calls can block indefinitely while other
+cameras stream -- with the GIL held, which stops every thread in the process.
+That was measured, twice, before the design changed to detect-and-report.
+
+Camera discovery therefore reads sysfs rather than asking the capture library,
+which also makes it safe from a background thread.
+
 ## Install
 
 ```sh
