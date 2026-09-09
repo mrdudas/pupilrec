@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Log GNSS position continuously, and into each recording as it happens.
 
-    ./run_gps.py                 # log to gps/<date>_gps.log.csv at 10 Hz
+    ./run_gps.py                 # 10 Hz into a recording, 0.1 Hz when idle
     ./run_gps.py --gps-only      # 18 Hz, GPS only, at the cost of fix quality
     ./run_gps.py --probe         # report what the receiver is doing and exit
 
@@ -21,6 +21,9 @@ PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 
 
 def parse_args():
+    # Imported here, as probe() does with its own, so the module stays cheap.
+    from gpslog.daemon import IDLE_PERIOD_S
+
     p = argparse.ArgumentParser(description="Continuous GNSS logger")
     p.add_argument("--server", default="http://127.0.0.1:8080",
                    help="recorder to follow for the per-recording copy")
@@ -31,6 +34,9 @@ def parse_args():
                    help="navigation period; below 55 ms the receiver clamps to 100")
     p.add_argument("--gps-only", action="store_true",
                    help="disable GLONASS/Galileo/BeiDou to reach 18 Hz")
+    p.add_argument("--idle-period", type=float, default=IDLE_PERIOD_S,
+                   help="seconds between logged rows while nothing is being "
+                        "recorded (default: %(default)s); 0 logs every row")
     p.add_argument("--probe", action="store_true", help="report status and exit")
     p.add_argument("-v", "--verbose", action="store_true")
     return p.parse_args()
@@ -92,7 +98,8 @@ def main() -> int:
     from gpslog.daemon import GpsDaemon
 
     period = args.period_ms or (55 if args.gps_only else 100)
-    return GpsDaemon(args.server, args.dir, period, args.gps_only, args.device).run()
+    return GpsDaemon(args.server, args.dir, period, args.gps_only, args.device,
+                     idle_period_s=max(0.0, args.idle_period)).run()
 
 
 if __name__ == "__main__":

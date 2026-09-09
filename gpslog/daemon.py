@@ -27,16 +27,35 @@ HEARTBEAT_S = 1.0
 # chance of a fix, which matters more than the extra 8 Hz.
 DEFAULT_PERIOD_MS = 100
 
+# What the always-on log costs when nothing is being recorded.  At 10 Hz it was
+# 535,000 rows and 68 MB in one day, nearly all of it "no fix" from sitting
+# indoors -- a rate that only earns its keep inside a recording.  So when no
+# recording is running the log keeps one row every ten seconds.
+#
+# The receiver itself is left at full rate rather than reconfigured.  Slowing it
+# down would save a little USB traffic, but a recording would then start on a
+# stale position and wait for the receiver to speed up again; keeping it at 10 Hz
+# means the first row of a recording is as fresh as every other one.
+IDLE_PERIOD_S = 10.0
+
+# The receiver rate is measured over two seconds, which is useless for the log
+# rate once it drops to a tenth of a hertz: a two second window can only ever
+# report nothing or five times the truth.  Half a minute holds three rows at
+# 0.1 Hz, which averages out to the right answer.
+LOG_RATE_WINDOW_S = 30.0
+
 
 class GpsDaemon:
     def __init__(self, base_url: str, directory: str, period_ms: int = DEFAULT_PERIOD_MS,
-                 gps_only: bool = False, device: str = ""):
+                 gps_only: bool = False, device: str = "",
+                 idle_period_s: float = IDLE_PERIOD_S):
         self.watcher = ServerWatcher(base_url)
         self.daily = DailyLog(directory)
         self.copy = RecordingCopy()
         self.period_ms = period_ms
         self.gnss = U.GPS_ONLY if gps_only else U.ALL_GNSS
         self.device_override = device
+        self.idle_period_s = idle_period_s
         self.heartbeat = Heartbeat(HEARTBEAT_PATH)
 
         self._stop = False
@@ -44,8 +63,14 @@ class GpsDaemon:
         self.device_path = ""
         self.last_fix: dict | None = None
         self.last_row_at = 0.0
-        self.rate_hz = 0.0
+        self.rate_hz = 0.0          # what the receiver delivers
+        # What reaches the always-on log, seeded with the rate the idle period
+        # asks for so the first half minute does not read as "nothing logged".
+        self.log_rate_hz = 1.0 / idle_period_s if idle_period_s else 0.0
+        self.throttled = False
         self.last_error = ""
+        self._last_kept = 0.0
+        self._last_kept_fix = None
 
     def stop(self, *_):
         self._stop = True
@@ -83,6 +108,23 @@ class GpsDaemon:
             self._serial = None
         self.device_path = ""
 
+    # -- what gets logged --------------------------------------------------
+
+    def keep_row(self, now: float, fix: dict, recording: bool) -> bool:
+        """Whether this row belongs in the always-on log.
+
+        Every row while a recording runs.  Otherwise one every idle period --
+        plus any row where the fix state changed, so the log still says when a
+        fix was gained or lost instead of reporting it up to ten seconds late.
+        """
+        keep = (recording
+                or fix.get("fix") != self._last_kept_fix
+                or now - self._last_kept >= self.idle_period_s)
+        if keep:
+            self._last_kept = now
+            self._last_kept_fix = fix.get("fix")
+        return keep
+
     # -- state for the UI -------------------------------------------------
 
     def _publish(self) -> None:
@@ -92,6 +134,9 @@ class GpsDaemon:
             "device": self.device_path,
             "connected": self._serial is not None,
             "rate_hz": round(self.rate_hz, 1),
+            "log_rate_hz": round(self.log_rate_hz, 2),
+            "throttled": self.throttled,
+            "idle_period_s": self.idle_period_s,
             "period_ms": self.period_ms,
             "fix": fix.get("fix", ""),
             "fix_ok": bool(fix.get("fix_ok")),
@@ -116,6 +161,7 @@ class GpsDaemon:
 
         reader = U.Reader()
         window_start, window_rows = time.monotonic(), 0
+        log_start, log_rows = time.monotonic(), 0
         last_beat = 0.0
         last_flush = time.monotonic()
 
@@ -143,6 +189,13 @@ class GpsDaemon:
 
                 now = time.time()
                 stamp = datetime.fromtimestamp(now)
+                # Ask where a recording is writing before handling this batch
+                # rather than after, so its very first rows are copied too --
+                # and so this batch is logged at the rate the recording wants.
+                self.copy.follow(self.watcher.snapshot())
+                recording = bool(self.copy.directory)
+                self.throttled = not recording
+
                 for cls, msg, payload in reader.feed(data or b""):
                     if (cls, msg) != (U.CLS_NAV, U.MSG_PVT):
                         continue
@@ -152,18 +205,24 @@ class GpsDaemon:
                     row = dict(fix, unix_time=f"{now:.3f}",
                                iso_time=stamp.isoformat(timespec="milliseconds"))
                     line = format_row(row)
-                    self.daily.write(stamp, line)
+                    # The recording's own copy always gets every row; only the
+                    # always-on log is thinned out while nothing is recording.
+                    if self.keep_row(now, fix, recording):
+                        self.daily.write(stamp, line)
+                        log_rows += 1
                     self.copy.write(line)
                     self.last_fix = fix
                     self.last_row_at = now
                     window_rows += 1
 
-                self.copy.follow(self.watcher.snapshot())
-
                 elapsed = time.monotonic() - window_start
                 if elapsed >= 2.0:
                     self.rate_hz = window_rows / elapsed
                     window_start, window_rows = time.monotonic(), 0
+                log_elapsed = time.monotonic() - log_start
+                if log_elapsed >= LOG_RATE_WINDOW_S:
+                    self.log_rate_hz = log_rows / log_elapsed
+                    log_start, log_rows = time.monotonic(), 0
                 if time.monotonic() - last_beat >= HEARTBEAT_S:
                     self._publish()
                     last_beat = time.monotonic()

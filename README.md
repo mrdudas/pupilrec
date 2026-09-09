@@ -249,6 +249,32 @@ Rate is **10 Hz with GPS, GLONASS, Galileo and BeiDou**. The receiver can reach
 worth losing three constellations, which for fix quality it usually is not. It
 clamps anything below a 55 ms period to 100 ms.
 
+**The daily log runs at 10 Hz only while something is being recorded.** The
+rest of the time it keeps one row every ten seconds. Around the clock at full
+rate the log reached 535,000 rows and 68 MB in a single day, nearly all of it
+`fix=none` from a receiver sitting indoors -- a rate that earns its keep inside
+a recording and almost nowhere else. `--idle-period` changes the interval, and
+`--idle-period 0` logs every row as before.
+
+What is *not* slowed down is the receiver. Reconfiguring it would save a little
+USB traffic, but a recording would then begin on a stale position and wait for
+the receiver to speed up again; at a constant 10 Hz the first row of a recording
+is as fresh as every other one, and the map and the health panel stay live while
+idle. The recording's own copy of the track is never thinned -- only the
+always-on log is, and the health chip says so (`napló 0.1 Hz`) rather than
+reporting a rate that is not being written.
+
+A thinned log still records a change of fix the moment it happens, rather than
+up to ten seconds later: when a fix appears or is lost is the one thing in an
+idle log worth having to the second.
+
+Full rate begins about half a second into a recording, which is how long the
+logger takes to notice one started (`STATUS_POLL_S`). The recording's own copy
+of the track has always begun at that same moment; what is new is that the
+half second before it is now in the daily log at idle resolution rather than at
+10 Hz. Measured on the rig: last idle row at 20:42:09.0, recording started at
+20:42:12, full rate from 20:42:12.6.
+
 Rows are written even with no fix: indoors the receiver reports `fix=none` with
 no position, and logging that documents the gap rather than leaving a silent
 hole. Position columns fill in only once the receiver reports a valid fix.

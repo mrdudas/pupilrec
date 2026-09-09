@@ -594,7 +594,10 @@ async function loadHealth() {
     chips.push(chip("idle", "GPS nincs csatlakoztatva"));
   } else {
     const fix = g.fix_ok ? `fix: ${g.fix}, ${g.num_sv} műhold` : `nincs fix (${g.num_sv} műhold)`;
-    chips.push(chip(g.fix_ok ? true : "idle", `GPS ${g.rate_hz} Hz — ${fix}`));
+    // The receiver runs at full rate whether or not anything is recording; the
+    // log does not, so saying only "10 Hz" would overstate what is being kept.
+    const log = g.throttled ? ` · napló ${g.log_rate_hz} Hz` : "";
+    chips.push(chip(g.fix_ok ? true : "idle", `GPS ${g.rate_hz} Hz${log} — ${fix}`));
     if (g.copy_rows) chips.push(chip(true, `GPS rögzítés a felvételbe (${g.copy_rows} sor)`));
   }
 
