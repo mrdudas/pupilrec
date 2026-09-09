@@ -14,6 +14,7 @@ import signal
 import sys
 import threading
 
+from pupilrec import systemd
 from pupilrec.capture import CameraSupervisor, build_workers
 from pupilrec.config import Config
 from pupilrec.server import local_addresses, serve
@@ -45,6 +46,16 @@ def main() -> int:
     # pyuvc logs every control transfer at debug level; far too chatty for -v.
     logging.getLogger("uvc").setLevel(logging.WARNING)
 
+    # Started before the cameras are touched, because opening one is itself a
+    # place the process can freeze: pyuvc holds the GIL inside libuvc, so a
+    # camera that never answers takes every thread down with it, this one
+    # included, and systemd restarting the service is the only way out.
+    watchdog = systemd.Watchdog()
+    watchdog.start()
+    # The interval has been read; take it out of the environment so that ffmpeg
+    # and systemctl, which this process spawns, cannot answer in its place.
+    systemd.clear_environment()
+
     cfg = Config.load()
     if args.host:
         cfg.host = args.host
@@ -56,6 +67,7 @@ def main() -> int:
         cfg.bandwidth_factor = args.bandwidth_factor
 
     if args.swap_sides:
+        watchdog.stop()
         flip = {"left": "right", "right": "left"}
         cfg.headsets = {port: flip.get(side, side) for port, side in cfg.headsets.items()}
         cfg.save()
@@ -72,6 +84,7 @@ def main() -> int:
     cfg.save()          # persist the port -> side assignment picked on first run
 
     if args.list:
+        watchdog.stop()
         for w in workers:
             print(f"{w.cam_id:14s} {w.product:16s} usb={w.usb_path:8s} "
                   f"uid={w.uid:8s} {w.width}x{w.height}@{w.fps}")
@@ -87,6 +100,20 @@ def main() -> int:
     supervisor = CameraSupervisor(
         cfg, state.note_attached, lambda: state.session is not None)
     supervisor.start()
+
+    def health_line() -> str:
+        """One line for `systemctl status`, built without taking a lock.
+
+        Whatever this reads must never block: a status line is decoration, and
+        this thread stalling is what tells systemd to restart the recorder.
+        """
+        running = list(state.workers.values())
+        up = sum(1 for w in running if w.stats.connected)
+        line = f"{up}/{len(running)} cameras streaming"
+        session = state.session
+        return line if session is None else f"{line}, recording {session.name}"
+
+    watchdog.set_status(health_line)
     print(f"\n  {len(workers)} cameras streaming. Open on the iPad:")
     for url in local_addresses(cfg.port):
         print(f"    {url}")
@@ -99,6 +126,9 @@ def main() -> int:
             return
         stopping.set()
         print("\nshutting down…")
+        # Tell systemd the silence from here on is deliberate, so a slow but
+        # healthy shutdown is not mistaken for the freeze this guards against.
+        systemd.stopping("shutting down")
         threading.Thread(target=httpd.shutdown, daemon=True).start()
 
     signal.signal(signal.SIGINT, shutdown)
@@ -117,6 +147,7 @@ def main() -> int:
             worker.stop()
         for worker in running:
             worker.join(timeout=5)
+        watchdog.stop()
         httpd.server_close()
     return 0
 

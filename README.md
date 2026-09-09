@@ -262,6 +262,7 @@ buttons. It refuses to restart anything mid-recording without a confirmation.
 | a camera drops its stream | the worker reopens it -- automatic |
 | the board stops responding | **Board tápciklizálása** power-cycles its USB port and restarts the daemon with it |
 | the recorder itself | **Kameraszerver újraindítása** |
+| the recorder freezes inside libuvc | the systemd watchdog restarts it within 20 s -- automatic |
 | a headset's USB hub re-enumerates | the cameras report "nincs jel"; a restart picks them back up |
 | the GNSS receiver is unplugged | logged as absent, picked up again on its own |
 
@@ -295,7 +296,60 @@ freezing the recorder, and the port is opened from scratch next time anyway.
 
 `uvc.Capture()` can block exactly the same way while the recorder is
 *starting*, and there nothing inside the process can help: no Python code runs
-to notice it -- that one is still open.
+to notice it. That one is answered from outside, by the watchdog.
+
+## The systemd watchdog
+
+`run.py` pings systemd roughly three times per `WatchdogSec` for as long as it
+can still run Python. When the pings stop, systemd kills the service and
+restarts it.
+
+That the ping comes from an ordinary Python thread is the whole design. The
+failure being guarded against is a C call holding the GIL, which stops every
+thread in the process -- so a ping is a direct test of the thing that breaks,
+and a frozen recorder cannot fake one. It also covers freezes nobody has seen
+yet, because it does not care *where* the process got stuck.
+
+```
+WatchdogSec=20        # four missed pings
+NotifyAccess=main     # without this systemd drops them: it defaults to
+                      # none for a Type=simple service
+```
+
+Twenty seconds is a deliberate floor, not a guess. A healthy camera open can
+hold the GIL for up to `FIRST_FRAME_TIMEOUT` (4 s) and the opens are
+serialised, so four slow-but-recovering cameras must not be mistaken for a
+freeze. Measured against the real thing: a start-up where one camera wedged
+inside `uvc.Capture()` stopped the pings dead and never sent another.
+
+The watchdog starts before the cameras are touched, so a freeze during
+start-up is covered too -- which is the case that hurts, since there is no
+recording to lose and no operator input to wait for. A deliberate shutdown
+sends `STOPPING=1` first, so a slow but healthy stop is not mistaken for a
+freeze, and each ping carries a status line for `systemctl status`:
+
+```
+Status: "4/4 cameras streaming, recording 2026-09-09_18-22-31_ut2"
+```
+
+None of this requires systemd. Run `run.py` from a terminal and
+`NOTIFY_SOCKET` is unset, every call is a no-op, and nothing changes. The
+variables are removed from the environment once read, so that ffmpeg and
+`systemctl is-active` -- both spawned by the recorder -- cannot answer in its
+place. (They try: `systemctl` reports its own `EXIT_STATUS` down an inherited
+socket.)
+
+**Installing it takes a `daemon-reload`**, because the watchdog lives in the
+unit file, not in the code:
+
+```
+sudo cp setup/pupilrec.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl restart pupilrec
+```
+
+Until that is done the code is inert -- systemd sets no `WATCHDOG_USEC`, the
+thread returns immediately, and the recorder behaves exactly as before.
 
 ## What a recording contains
 
@@ -376,6 +430,7 @@ pupilrec/usbmap.py     cameras -> physical USB port -> headset
 pupilrec/capture.py    one thread per camera; fans frames out to preview + recording
 pupilrec/recording.py  ffmpeg stream-copy muxing and the timestamp tables
 pupilrec/server.py     HTTP API and MJPEG preview streams (standard library only)
+pupilrec/systemd.py    liveness pings, so a frozen recorder gets restarted
 pupilrec/static/       the iPad UI
 setup/                 udev rules, installer, systemd unit
 ```

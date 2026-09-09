@@ -16,8 +16,25 @@ User=zsolt
 SupplementaryGroups=plugdev
 WorkingDirectory=/home/zsolt/aimotive
 ExecStart=/home/zsolt/aimotive/.venv/bin/python /home/zsolt/aimotive/run.py
+
+# The recorder can freeze in a way it cannot detect or recover from itself:
+# pyuvc does its USB work with the GIL held, so a camera wedged inside libuvc
+# stops every thread in the process -- the HTTP server and signal delivery
+# included, which is why SIGTERM does not land on a frozen recorder.  run.py
+# pings systemd while it can still run Python; when the pings stop, systemd
+# kills and restarts it.  NotifyAccess is what lets those pings through: it
+# defaults to none for a Type=simple service, and they would be dropped.
+#
+# 20s is four missed pings.  Shorter is tempting, but a healthy camera open can
+# legitimately hold the GIL for up to FIRST_FRAME_TIMEOUT (4s) and they are
+# serialised, so a slow start with four cameras must not be mistaken for a
+# freeze.  Long enough not to fire on a bad day, short enough that a freeze
+# costs seconds rather than waiting for someone to notice.
+NotifyAccess=main
+WatchdogSec=20
 # run.py exits non-zero when it finds no cameras, so at boot this keeps retrying
 # while USB enumeration finishes instead of giving up after the default 5 tries.
+# A watchdog timeout counts as a failure here, so it restarts the same way.
 Restart=on-failure
 RestartSec=5
 StartLimitIntervalSec=120
