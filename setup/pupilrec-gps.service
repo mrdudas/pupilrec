@@ -4,6 +4,10 @@
 [Unit]
 Description=GNSS logger (continuous, copies into recordings)
 After=network-online.target
+# The restart rate-limit below bounds Restart= in [Service], but the two keys
+# themselves belong in [Unit]: systemd ignores them under [Service].
+StartLimitIntervalSec=600
+StartLimitBurst=10
 
 [Service]
 Type=simple
@@ -14,8 +18,6 @@ WorkingDirectory=/home/zsolt/aimotive
 ExecStart=/home/zsolt/aimotive/.venv/bin/python /home/zsolt/aimotive/run_gps.py
 Restart=always
 RestartSec=10
-StartLimitIntervalSec=600
-StartLimitBurst=10
 
 [Install]
 WantedBy=multi-user.target

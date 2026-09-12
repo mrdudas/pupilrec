@@ -6,6 +6,10 @@
 Description=Pupil Core recording front-end
 After=network-online.target
 Wants=network-online.target
+# The restart rate-limit below bounds Restart= in [Service], but the two keys
+# themselves belong in [Unit]: systemd ignores them under [Service].
+StartLimitIntervalSec=120
+StartLimitBurst=12
 
 [Service]
 Type=simple
@@ -37,8 +41,6 @@ WatchdogSec=20
 # A watchdog timeout counts as a failure here, so it restarts the same way.
 Restart=on-failure
 RestartSec=5
-StartLimitIntervalSec=120
-StartLimitBurst=12
 
 [Install]
 WantedBy=multi-user.target
