@@ -72,7 +72,8 @@ cp "${BUILD}/datalog1/Utilities/HSDPython_SDK/st_hsdatalog/st_hsdatalog/HSD_link
    "${ROOT}/vendor/"
 
 # Lets the web UI restart the services and power-cycle the board.  The sudoers
-# rule grants password-less root for exactly these three actions, nothing else.
+# rule grants password-less root for exactly the actions this helper names,
+# nothing else.
 echo "==> recovery helper"
 sudo install -m 0755 "${ROOT}/setup/pupilrec-recover" /usr/local/sbin/
 sudo install -m 0440 "${ROOT}/setup/pupilrec-sudoers" /etc/sudoers.d/pupilrec

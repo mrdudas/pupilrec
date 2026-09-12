@@ -1,3 +1,6 @@
-# Lets the recorder's web UI restart its own services and power-cycle the sensor
-# board, without granting anything else.  Installed to /etc/sudoers.d/pupilrec.
-zsolt ALL=(root) NOPASSWD: /usr/local/sbin/pupilrec-recover sensors, /usr/local/sbin/pupilrec-recover server, /usr/local/sbin/pupilrec-recover board
+# Lets the recorder's web UI (and the console) restart its own services, reload
+# their unit files and power-cycle the sensor board, without granting anything
+# else.  One entry per action rather than a wildcard: the argument is what keeps
+# this narrow, so it must not be something the caller can choose freely.
+# Installed to /etc/sudoers.d/pupilrec.
+zsolt ALL=(root) NOPASSWD: /usr/local/sbin/pupilrec-recover sensors, /usr/local/sbin/pupilrec-recover server, /usr/local/sbin/pupilrec-recover gps, /usr/local/sbin/pupilrec-recover board, /usr/local/sbin/pupilrec-recover reload

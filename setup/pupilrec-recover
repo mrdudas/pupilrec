@@ -6,7 +6,9 @@ password-less root to exactly this script, so it must not take arbitrary input.
 
   pupilrec-recover sensors   restart the sensor daemon
   pupilrec-recover server    restart the camera recorder
+  pupilrec-recover gps       restart the GNSS logger
   pupilrec-recover board     power-cycle the STWIN board's USB port
+  pupilrec-recover reload    re-read the unit files in /etc/systemd/system
 """
 
 import glob
@@ -15,7 +17,7 @@ import subprocess
 import sys
 
 STWIN_VID, STWIN_PID = "0483", "5744"
-ACTIONS = ("sensors", "server", "board")
+ACTIONS = ("sensors", "server", "gps", "board", "reload")
 
 
 def usb_port_of_board():
@@ -54,6 +56,16 @@ def main():
         # response goes out before systemd tears the service down.
         return subprocess.call(["systemctl", "restart", "--no-block",
                                 "pupilrec.service"])
+
+    if action == "gps":
+        return subprocess.call(["systemctl", "restart", "--no-block",
+                                "pupilrec-gps.service"])
+    if action == "reload":
+        # Only re-reads what is already in /etc/systemd/system.  Installing a
+        # unit file there still asks for a password on purpose: the copies under
+        # setup/ are writable by the very user this rule grants root to, so
+        # copying them as root would turn this into a way to run anything.
+        return subprocess.call(["systemctl", "daemon-reload"])
 
     where = usb_port_of_board()
     if where is None:
