@@ -1,8 +1,11 @@
 """HTTP front-end: live preview of every camera plus recording control.
 
-Preview frames are shipped as multipart MJPEG, which is the same bytes the
-cameras produced -- the server never decodes or re-encodes an image.  Recording
-always stores every captured frame regardless of what the preview is showing.
+Preview frames are shipped as multipart MJPEG.  They are the bytes the cameras
+produced, except that a role configured with a preview_scale below 1.0 is
+decoded and re-encoded smaller first (see preview.py): four full-size cameras
+are more than the tablet's Wi-Fi can carry, and the preview only has to show
+where a camera is pointed.  Recording is untouched by any of this -- it always
+stores every captured frame at full size, whatever the preview is showing.
 """
 
 from __future__ import annotations
@@ -25,6 +28,7 @@ import shutil
 import subprocess
 
 from .gpstrack import TrackStore
+from .preview import PreviewScaler
 from .tiles import TileCache
 from .recording import RecordingSession, join_name, split_name
 
@@ -89,6 +93,13 @@ class AppState:
         # Live preview viewers per camera, only for display.
         self.viewers = collections.Counter()
         self.viewers_lock = threading.Lock()
+
+        # One scaler per camera, so several viewers of the same camera shrink
+        # each frame once between them instead of once each.
+        self.scalers = {
+            cam_id: PreviewScaler(cfg.scale_for(worker.role))
+            for cam_id, worker in self.workers.items()
+        }
 
         # config.json is rewritten whenever a camera control changes; two
         # clients turning knobs at once must not interleave inside the file.
@@ -537,10 +548,11 @@ class Handler(BaseHTTPRequestHandler):
         worker = self.state.workers.get(cam_id)
         if worker is None:
             return self._error("Unknown camera", HTTPStatus.NOT_FOUND)
-        _, frame = worker.latest_frame(after_seq=-1, timeout=5.0)
+        seq, frame = worker.latest_frame(after_seq=-1, timeout=5.0)
         if frame is None:
             return self._error("No frame available", HTTPStatus.SERVICE_UNAVAILABLE)
-        return self._send_bytes(frame.jpeg, "image/jpeg")
+        jpeg = self.state.scalers[cam_id].scaled(seq, frame.jpeg)
+        return self._send_bytes(jpeg, "image/jpeg")
 
     def _stream(self, cam_id: str, query):
         worker = self.state.workers.get(cam_id)
@@ -567,6 +579,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Connection", "close")
         self.end_headers()
 
+        scaler = self.state.scalers[cam_id]
         seq = -1
         next_due = 0.0
         try:
@@ -579,13 +592,16 @@ class Handler(BaseHTTPRequestHandler):
                     if now < next_due:
                         continue                   # throttle: skip this frame
                     next_due = now + min_interval
+                    # After the throttle, so a frame nobody will see is never
+                    # scaled: at 10 fps of 60 that is five sixths of the work.
+                    jpeg = scaler.scaled(seq, frame.jpeg)
                     head = (
                         f"--{BOUNDARY}\r\n"
                         f"Content-Type: image/jpeg\r\n"
-                        f"Content-Length: {len(frame.jpeg)}\r\n\r\n"
+                        f"Content-Length: {len(jpeg)}\r\n\r\n"
                     ).encode()
                     self.wfile.write(head)
-                    self.wfile.write(frame.jpeg)
+                    self.wfile.write(jpeg)
                     self.wfile.write(b"\r\n")
         except (BrokenPipeError, ConnectionResetError, TimeoutError, OSError):
             pass                                    # viewer navigated away

@@ -5,3 +5,8 @@ pupil-labs-uvc @ git+https://github.com/pupil-labs/pyuvc
 
 # Only used by the diagnostic paths that talk to the STWIN board directly.
 pyusb
+
+# Shrinks preview frames before they go out over Wi-Fi (pupilrec/preview.py).
+# Without it the preview still works, at full size -- so it is worth having, but
+# nothing breaks on a host that cannot install it.
+Pillow

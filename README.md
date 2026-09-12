@@ -90,9 +90,22 @@ rules only covers a local desktop session.
 2. Optionally type a name, press **Felvétel indítása**.
 3. Press **Felvétel leállítása**. The files are closed and listed underneath.
 
-The preview is throttled (10 fps by default, selectable in the header) so that
-Wi-Fi never limits what gets recorded. **Recording always stores every captured
-frame** regardless of what the preview shows.
+The preview is throttled (10 fps by default, selectable in the header) and the
+world cameras are sent at half size, so that Wi-Fi never limits what gets
+recorded. **Recording always stores every captured frame, at full size**,
+regardless of what the preview shows.
+
+Half size is what makes four live cameras comfortable on one link: a 720p world
+frame off these cameras is ~115 KB, and 640x360 at quality 85 is ~12 KB, so a
+world preview costs ~0.1 MB/s instead of ~1.0 MB/s. The eye cameras are small
+enough to go out untouched. Both are per role in `config.json`:
+
+```json
+"preview_scale": { "world": 0.5, "eye": 1.0 }
+```
+
+`1.0` ships the camera's own JPEG with no decoding at all, which is what to set
+if a preview needs to be pixel-exact -- at the bandwidth that costs.
 
 ## Camera settings
 
@@ -511,7 +524,8 @@ in the UI and in `recording.json` as `dropped_queue`.
 pupilrec/usbmap.py     cameras -> physical USB port -> headset
 pupilrec/capture.py    one thread per camera; fans frames out to preview + recording
 pupilrec/recording.py  ffmpeg stream-copy muxing and the timestamp tables
-pupilrec/server.py     HTTP API and MJPEG preview streams (standard library only)
+pupilrec/server.py     HTTP API and MJPEG preview streams
+pupilrec/preview.py    shrinks preview frames so Wi-Fi carries less than capture
 pupilrec/systemd.py    liveness pings, so a frozen recorder gets restarted
 pupilrec/static/       the iPad UI
 setup/                 udev rules, installer, systemd unit

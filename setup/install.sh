@@ -51,6 +51,12 @@ echo "==> Python environment"
 [ -d .venv ] || python3 -m venv .venv
 ./.venv/bin/pip install --quiet --upgrade pip
 
+# The two plain wheels.  requirements.txt lists pyuvc as well, which is why it
+# is not simply installed from there: pyuvc needs the local clone and the
+# pkg-config path set below, and pip would take the broken PyPI build instead.
+echo "==> Python packages"
+./.venv/bin/pip install --quiet Pillow pyusb
+
 # pyuvc must come from git, not PyPI: the published 1.0.0b7 wheel calls the old
 # three-argument uvc_open(), which leaves libuvc's `subdevice` field
 # uninitialised and makes every open fail with "Device is not UVC-compliant".

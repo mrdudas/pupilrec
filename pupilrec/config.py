@@ -51,6 +51,17 @@ class Config:
         default_factory=lambda: {"world": 10.0, "eye": 10.0}
     )
 
+    # And shrunk independently of capture, per role, before frames leave the
+    # host.  The world cameras are what makes a four-camera preview too much for
+    # the tablet's Wi-Fi: ~1 MB/s each at 720p against ~0.2 MB/s for an eye.
+    # Half sides measure at about a tenth of that -- 0.1 MB/s against 1.0 -- and
+    # still show the operator what the camera is pointed at.  1.0 sends the
+    # camera's own JPEG untouched, which is what the already small eye frames
+    # want.  Recording is unaffected either way.
+    preview_scale: dict[str, float] = field(
+        default_factory=lambda: {"world": 0.5, "eye": 1.0}
+    )
+
     # Image controls (brightness, gain, exposure, ...) per camera id, as
     # {"left_world": {"Brightness": 32, ...}}.  The value really does live in
     # the camera -- but only until it loses power, and a headset loses power on
@@ -72,6 +83,19 @@ class Config:
     def forget_controls(self, cam_id: str) -> None:
         """Drop the stored values so the camera keeps its own defaults."""
         self.camera_controls.pop(cam_id, None)
+
+    def scale_for(self, role: str) -> float:
+        """How much of its own size a role's preview frames keep.
+
+        Clamped rather than trusted: this comes from a hand-edited file, and a
+        misplaced decimal point should cost some bandwidth, not hand the tablet
+        a one-pixel image or a preview larger than the camera can produce.
+        """
+        try:
+            factor = float(self.preview_scale.get(role, 1.0))
+        except (TypeError, ValueError):
+            return 1.0
+        return min(1.0, max(0.1, factor))
 
     def mode_for(self, role: str) -> tuple[int, int, int]:
         w, h, fps = self.modes.get(role, DEFAULT_MODES[role])
