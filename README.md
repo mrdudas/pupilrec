@@ -27,6 +27,26 @@ The first run assigns the lower-numbered port to `left` and stores it in
 ./run.py --swap-sides
 ```
 
+### Two eye cameras on one headset
+
+A headset carrying two eye cameras produces `<side>_eye` and `<side>_eye2`, and
+**which file holds which eye is data, not cosmetics** -- so it is worth checking
+once, by hand, rather than assuming. The numbering follows the physical USB port
+order within the headset, which is stable across replugs, so it does not drift
+between runs; but nothing in the software knows which socket the manufacturer
+wired to which side.
+
+Check it once by covering one eye and watching the two previews, and write the
+answer down next to the recordings. On the MacBook rig the mapping is:
+
+| cam_id       | camera           | USB port |
+|--------------|------------------|----------|
+| `left_world` | `Pupil Cam1 ID2` | `20-1.1` |
+| `left_eye`   | `Pupil Cam2 ID0` | `20-1.3` |
+| `left_eye2`  | `Pupil Cam2 ID1` | `20-1.4` |
+
+`./run.py --list` prints this at any time.
+
 ## More than two headsets
 
 Headsets and their cameras are optional and discovered at start-up. Two get the
@@ -62,6 +82,48 @@ It installs the system packages, builds Pupil Labs' `libuvc` fork, installs
 `pyuvc` **from git**, and drops in the udev rules. Both details matter --
 see [docs/USB-BANDWIDTH.md](docs/USB-BANDWIDTH.md) for why the kernel's V4L2
 driver cannot run these four cameras at all, and which two traps the stack has.
+
+### On macOS
+
+```sh
+brew install libusb pkg-config ffmpeg
+python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+sudo ./setup/install-macos.sh
+```
+
+Everything above the capture layer is the same code; three things differ, and
+all three were measured on a MacBook (macOS 15.7.3, Intel) with one Pupil Core:
+
+**It must run as root.** libusb can only take a UVC camera away from the macOS
+driver as root -- without it `uvc.Capture()` fails with "Access denied", every
+time. So the service is a LaunchDaemon (`setup/com.pupilrec.plist`), not a
+LaunchAgent. One happy side effect: the camera privacy prompt (TCC) never
+applies, because libusb does not go through AVFoundation at all. The cost is
+that recordings are written by root, which `Umask` in the plist plus a setgid
+`recordings/` directory keeps usable for the logged-in user.
+
+**There is no sysfs, and no systemd watchdog.** `usbmap.py` reads the same
+information out of `ioreg` instead, which matters for the same reason sysfs does
+on Linux: it is a separate process, so it cannot block inside libusb while the
+cameras stream. macOS `locationID` is the counterpart of a sysfs path -- it
+encodes the physical hub-and-port chain and survives a replug, unlike the
+`bus:address` uid. The watchdog is replaced by `setup/pupilrec-healthcheck`,
+which polls `/api/health` on a timer and kickstarts the job after three
+consecutive failures; see that file for why three and not one.
+
+**AVFoundation is not an alternative.** It was tried first and rejected on
+evidence: the cameras offer it only `yuvs` and `420v`, never `dmb1`, because the
+macOS UVC driver decodes the MJPEG before anything can see it. That path cost
+the bit-identical recording, both the `device_time` and `uvc_index` columns, and
+frame rate as well -- 46/113/108 fps against libuvc's 61/121/120 on the same
+three cameras. Do not reach for it again without reading this paragraph.
+
+Two macOS-specific habits worth keeping: stop the machine sleeping
+(`sudo pmset -a disablesleep 1`), because USB devices re-enumerate on wake and
+the recorder deliberately does not reopen cameras mid-session; and remember that
+launchd hands a daemon a `PATH` without `/usr/local/bin`, so `ffmpeg` has to be
+put back on it in the plist -- without that the recorder streams perfectly and
+every recording fails.
 
 ## Run
 

@@ -1,0 +1,80 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  The macOS counterpart of setup/pupilrec.service.
+
+    sudo cp setup/com.pupilrec.plist /Library/LaunchDaemons/
+    sudo launchctl bootstrap system /Library/LaunchDaemons/com.pupilrec.plist
+
+  A LaunchDaemon, not a LaunchAgent, and deliberately running as root: libusb
+  can only take a UVC camera away from the system driver as root.  Without it
+  every uvc.Capture() fails with "Access denied", measured on this machine.
+  A useful side effect is that the camera privacy prompt (TCC) never applies,
+  because libusb does not go through AVFoundation at all.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.pupilrec</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/zsolt/aimotive/.venv/bin/python</string>
+        <string>/Users/zsolt/aimotive/run.py</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/zsolt/aimotive</string>
+
+    <!-- launchd hands a daemon a bare PATH of /usr/bin:/bin:/usr/sbin:/sbin,
+         which leaves out /usr/local/bin and therefore ffmpeg.  Without this the
+         recorder starts and streams perfectly, and every attempt to record
+         fails with "No such file or directory: 'ffmpeg'" -- measured. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Restart=on-failure.  run.py exits non-zero when it finds no cameras,
+         so at boot this keeps retrying while USB enumeration finishes, and a
+         clean shutdown (exit 0) is left alone. -->
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+
+    <!-- RestartSec=5, and the closest thing launchd has to systemd's
+         StartLimitIntervalSec/StartLimitBurst: it simply refuses to respawn
+         more often than this. -->
+    <key>ThrottleInterval</key>
+    <integer>5</integer>
+
+    <!-- Recordings are written by root.  002 keeps them group-writable so the
+         logged-in user can still delete and copy their own recordings; the
+         recordings directory itself is setgid staff (see install-macos.sh). -->
+    <key>Umask</key>
+    <integer>2</integer>
+
+    <!-- Capture is latency-sensitive: three cameras deliver ~300 frames a
+         second between them, and the default background service treatment
+         throttles both CPU and I/O. -->
+    <key>ProcessType</key>
+    <string>Interactive</string>
+
+    <key>StandardOutPath</key>
+    <string>/Users/zsolt/aimotive/var/pupilrec.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/zsolt/aimotive/var/pupilrec.log</string>
+
+    <!-- No equivalent of WatchdogSec here.  The recorder can freeze with the
+         GIL held inside libuvc, and launchd cannot see that: the process is
+         alive, it just answers nothing.  com.pupilrec.healthcheck.plist polls
+         /api/health and kickstarts this job when it stops answering. -->
+</dict>
+</plist>

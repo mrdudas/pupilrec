@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  The watchdog launchd does not have.  See setup/pupilrec-healthcheck for why a
+  frozen recorder is invisible to launchd, and why three strikes rather than one.
+
+    sudo cp setup/com.pupilrec.healthcheck.plist /Library/LaunchDaemons/
+    sudo launchctl bootstrap system /Library/LaunchDaemons/com.pupilrec.healthcheck.plist
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.pupilrec.healthcheck</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/sbin/pupilrec-healthcheck</string>
+    </array>
+
+    <!-- Every 10 seconds; three failures before acting, so a freeze costs about
+         30 seconds. -->
+    <key>StartInterval</key>
+    <integer>10</integer>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/zsolt/aimotive/var/healthcheck.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/zsolt/aimotive/var/healthcheck.log</string>
+</dict>
+</plist>

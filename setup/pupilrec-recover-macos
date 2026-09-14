@@ -1,0 +1,59 @@
+#!/usr/bin/env python3
+"""The macOS counterpart of setup/pupilrec-recover, installed under the same name.
+
+The web UI calls `sudo -n /usr/local/sbin/pupilrec-recover <action>`, so keeping
+the name and the argument set means server.py needs no change.  The daemon
+already runs as root here, so sudo has nothing to grant and there is no sudoers
+rule to install -- which also means this script must stay exactly as small and
+as fixed-argument as the Linux one.
+
+  pupilrec-recover server    restart the camera recorder
+  pupilrec-recover sensors   -- not installed on this machine
+  pupilrec-recover gps       -- not installed on this machine
+  pupilrec-recover board     -- not installed on this machine
+"""
+
+import os
+import subprocess
+import sys
+
+LABEL = "com.pupilrec"
+ACTIONS = ("sensors", "server", "gps", "board", "reload")
+
+# The three cameras are all this machine runs.  The sensor board and the GNSS
+# receiver live on the Linux rig; saying so plainly beats a command that fails
+# with something cryptic.
+NOT_HERE = {
+    "sensors": "the sensor daemon",
+    "gps": "the GNSS logger",
+    "board": "the sensor board",
+}
+
+
+def main() -> int:
+    if len(sys.argv) != 2 or sys.argv[1] not in ACTIONS:
+        print(f"usage: {os.path.basename(sys.argv[0])} {{{'|'.join(ACTIONS)}}}",
+              file=sys.stderr)
+        return 2
+    action = sys.argv[1]
+
+    if action in NOT_HERE:
+        print(f"{NOT_HERE[action]} is not installed on this machine "
+              f"(cameras only)", file=sys.stderr)
+        return 1
+
+    if action == "reload":
+        # Deliberately not implemented.  On Linux this only re-reads unit files
+        # already in place; the launchd equivalent (bootout then bootstrap) can
+        # replace what runs as root, so it stays a manual, authenticated step.
+        print("reload is not available here: re-bootstrap the job by hand",
+              file=sys.stderr)
+        return 1
+
+    # This kills the process making the request, so the HTTP reply has already
+    # gone out by the time server.py calls us -- same contract as on Linux.
+    return subprocess.call(["launchctl", "kickstart", "-k", f"system/{LABEL}"])
+
+
+if __name__ == "__main__":
+    sys.exit(main())

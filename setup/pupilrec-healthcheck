@@ -1,0 +1,117 @@
+#!/usr/bin/env python3
+"""What replaces systemd's WatchdogSec on macOS.
+
+The recorder can freeze in a way it cannot report and launchd cannot see: pyuvc
+does its USB work with the GIL held, so a camera wedged inside libuvc stops
+every thread in the process.  The process stays alive and launchd stays happy,
+while nothing records and the HTTP server answers nothing.
+
+So health is measured from outside, by asking the server itself.  Three
+consecutive failures -- not one -- before acting, because a single missed reply
+is cheap to wait out and a needless restart costs a recording.
+
+  pupilrec-healthcheck          one probe; run it from launchd on an interval
+  pupilrec-healthcheck --once   same, but never restarts (for testing)
+"""
+
+import json
+import os
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+
+LABEL = "com.pupilrec"
+HEALTH_URL = "http://127.0.0.1:8080/api/health"
+STATE_PATH = "/Users/zsolt/aimotive/var/healthcheck.json"
+
+# A probe must not hang: this runs on a timer, and a stuck probe would pile up.
+TIMEOUT = 3.0
+# Three strikes at the launchd interval (10s) means a freeze costs ~30 seconds,
+# in the same range as the 20s WatchdogSec on the Linux rig.
+FAILURES_BEFORE_RESTART = 3
+# A restart takes a while to come back: opening three cameras is serialised and
+# each one may take seconds.  Do not count failures against a job that is still
+# starting up, or the healthcheck restarts it forever.
+GRACE_AFTER_RESTART = 60.0
+
+
+def probe() -> tuple[bool, str]:
+    """-> (healthy, why not).  Healthy means answering AND actually streaming."""
+    try:
+        with urllib.request.urlopen(HEALTH_URL, timeout=TIMEOUT) as response:
+            data = json.load(response)
+    except urllib.error.URLError as exc:
+        return False, f"no answer: {exc.reason}"
+    except (TimeoutError, OSError) as exc:
+        return False, f"no answer: {exc}"
+    except json.JSONDecodeError as exc:
+        return False, f"bad answer: {exc}"
+
+    cameras = data.get("cameras", {})
+    if not cameras.get("streaming"):
+        connected = cameras.get("connected", 0)
+        total = cameras.get("total", 0)
+        return False, f"answering, but not streaming ({connected}/{total} cameras)"
+    return True, ""
+
+
+def load_state() -> dict:
+    try:
+        with open(STATE_PATH) as fh:
+            return json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def save_state(state: dict) -> None:
+    os.makedirs(os.path.dirname(STATE_PATH), exist_ok=True)
+    tmp = STATE_PATH + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(state, fh)
+    os.replace(tmp, STATE_PATH)
+
+
+def restart() -> None:
+    # kickstart -k: stop it, then start it again.  As root there is no sudo in
+    # the way, which is why the Linux sudoers rule has no counterpart here.
+    subprocess.call(["launchctl", "kickstart", "-k", f"system/{LABEL}"])
+
+
+def main() -> int:
+    dry_run = "--once" in sys.argv
+    state = load_state()
+    now = time.time()
+
+    healthy, why = probe()
+    if healthy:
+        if state.get("failures"):
+            print("recovered")
+        save_state({"failures": 0, "last_ok": now,
+                    "restarted_at": state.get("restarted_at", 0)})
+        return 0
+
+    since_restart = now - state.get("restarted_at", 0)
+    if since_restart < GRACE_AFTER_RESTART:
+        print(f"unhealthy ({why}), but only {since_restart:.0f}s since the last "
+              f"restart -- leaving it alone")
+        return 0
+
+    failures = state.get("failures", 0) + 1
+    print(f"unhealthy ({why}) -- failure {failures} of {FAILURES_BEFORE_RESTART}")
+
+    if failures < FAILURES_BEFORE_RESTART or dry_run:
+        state["failures"] = failures
+        save_state(state)
+        return 1
+
+    print(f"restarting {LABEL}")
+    restart()
+    save_state({"failures": 0, "last_ok": state.get("last_ok", 0),
+                "restarted_at": now})
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
