@@ -52,8 +52,11 @@ class _Notifier:
         if self._address is None:
             return
         try:
-            self._sock = socket.socket(socket.AF_UNIX,
-                                       socket.SOCK_DGRAM | socket.SOCK_CLOEXEC)
+            # No SOCK_CLOEXEC: Python has opened every descriptor of its own
+            # non-inheritable since 3.4, so the flag added nothing -- and it
+            # does not exist outside Linux, where asking for it is an
+            # AttributeError rather than a socket.
+            self._sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
         except OSError:
             logger.exception("could not open the systemd notify socket")
 
