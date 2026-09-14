@@ -442,6 +442,7 @@ function build(cameras) {
           <span class="name">${cameraLabel(cam)}</span>
           <span>${cam.width}×${cam.height}</span>
           <span class="num" id="fps-${cam.id}">–</span>
+          <span class="num lum" id="lum-${cam.id}" title="A kép közepének átlagos fényessége 0-255 között. A Pupil automatikája 90 és 150 közé szabályoz; ezen kívül a kép túl sötét vagy kiégett."></span>
           <span style="flex:1"></span>
           <span class="num" id="cnt-${cam.id}"></span>
           <button class="gear" title="Kamera beállításai" data-cam="${cam.id}">⚙</button>
@@ -523,10 +524,18 @@ async function refresh() {
   lastVersion = st.state_version;
 
   st.cameras.forEach(c => {
-    const fps = $(`fps-${c.id}`), cnt = $(`cnt-${c.id}`);
+    const fps = $(`fps-${c.id}`), cnt = $(`cnt-${c.id}`), lum = $(`lum-${c.id}`);
     if (fps) {
       fps.textContent = c.connected ? `${c.fps.toFixed(1)} fps` : "nincs jel";
       fps.className = "num" + (c.connected ? "" : " warn");
+    }
+    /* Brightness is shown only when it is worth acting on: a number an operator
+       cannot judge is noise, so the band Pupil aims for is what decides. */
+    if (lum) {
+      const known = c.connected && c.brightness >= 0;
+      const off = known && (c.brightness < 90 || c.brightness > 150);
+      lum.textContent = known ? `☼ ${Math.round(c.brightness)}` : "";
+      lum.className = "num lum" + (off ? " warn" : "");
     }
     if (cnt) {
       const bad = c.dropped_queue > 0;

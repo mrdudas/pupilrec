@@ -37,6 +37,46 @@ logger = logging.getLogger(__name__)
 JPEG_QUALITY = 85
 
 
+def brightness_of(jpeg: bytes, window: float = 0.5) -> float:
+    """Mean brightness of the middle of a frame, 0-255.  -1 if it cannot be read.
+
+    The middle, not the whole frame, because that is where the subject is: an
+    eye camera's corners see eyelid and skin at a different exposure, and a
+    number that averages them says less about the picture than one that does
+    not.  Pupil's own auto exposure works the same way, on a weighted centre
+    window, and aims for 90 to 150 -- which is what makes this worth showing to
+    an operator who otherwise has only their own eyes on a tablet in daylight.
+
+    Cheap on purpose: libjpeg is asked for a small greyscale decode (draft does
+    both in one pass), so this costs a fraction of a millisecond and can be
+    sampled once a second per camera without competing with capture.
+    """
+    if not jpeg:
+        return -1.0
+    try:
+        from PIL import Image
+    except ImportError:
+        return -1.0
+    try:
+        img = Image.open(io.BytesIO(jpeg))
+        img.draft("L", (64, 64))
+        img = img.convert("L")
+        width, height = img.size
+        box_w = max(1, int(width * window))
+        box_h = max(1, int(height * window))
+        left = (width - box_w) // 2
+        top = (height - box_h) // 2
+        middle = img.crop((left, top, left + box_w, top + box_h))
+        counts = middle.histogram()
+        pixels = sum(counts)
+        if not pixels:
+            return -1.0
+        return sum(level * n for level, n in enumerate(counts)) / pixels
+    except Exception:
+        # A frame too corrupt to measure is not worth a log line every second.
+        return -1.0
+
+
 class PreviewScaler:
     """Shrinks one camera's frames, once per frame however many viewers watch.
 

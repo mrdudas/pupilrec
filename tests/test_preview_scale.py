@@ -11,7 +11,7 @@ import unittest
 from unittest import mock
 
 from pupilrec.config import Config
-from pupilrec.preview import PreviewScaler
+from pupilrec.preview import PreviewScaler, brightness_of
 
 try:
     from PIL import Image
@@ -123,3 +123,36 @@ class ConfiguredScaleTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@unittest.skipIf(Image is None, "Pillow is not installed")
+class BrightnessTest(unittest.TestCase):
+    """The number an operator uses to decide whether a camera is aimed and lit."""
+
+    def flat(self, level: int, size: int = 400) -> bytes:
+        out = io.BytesIO()
+        Image.new("L", (size, size), level).save(out, format="JPEG", quality=90)
+        return out.getvalue()
+
+    def test_a_black_frame_reads_near_zero(self):
+        self.assertLess(brightness_of(self.flat(0)), 3)
+
+    def test_a_white_frame_reads_near_full(self):
+        self.assertGreater(brightness_of(self.flat(255)), 250)
+
+    def test_it_tracks_the_level(self):
+        values = [brightness_of(self.flat(level)) for level in (20, 80, 160)]
+        self.assertEqual(values, sorted(values))
+        self.assertAlmostEqual(values[1], 80, delta=6)
+
+    def test_only_the_middle_counts(self):
+        """A bright rim with a dark centre is a dark picture, which is the point."""
+        img = Image.new("L", (400, 400), 255)
+        img.paste(0, (100, 100, 300, 300))
+        out = io.BytesIO()
+        img.save(out, format="JPEG", quality=90)
+        self.assertLess(brightness_of(out.getvalue()), 40)
+
+    def test_an_unreadable_frame_is_reported_as_unknown(self):
+        self.assertEqual(brightness_of(b"\xff\xd8 not a jpeg"), -1.0)
+        self.assertEqual(brightness_of(b""), -1.0)

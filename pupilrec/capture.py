@@ -96,6 +96,55 @@ def describe_control(ctrl) -> dict:
     }
 
 
+# What Pupil's own software writes into these cameras before it touches
+# anything else (pupil_src/shared_modules/video_capture/uvc_backend.py,
+# _configure_capture).  These are Pupil Core cameras being used for what Pupil
+# Core cameras are for, and leaving them on their factory values is not a
+# neutral choice: measured here, the eye cameras' dark range is six times
+# darker at the factory Gamma of 144 than at the 200 Pupil sets, and the
+# chroma channels of a monochrome infrared sensor cost JPEG size to carry
+# nothing.  Auto Exposure Priority is the one that matters even where the
+# picture looks the same: at 1 the camera is allowed to drop the frame rate to
+# reach an exposure, which is precisely what a recorder running at a fixed 120
+# fps must not permit.
+#
+# Whatever the operator has stored is written after this and wins.
+_EYE_BASELINE_CAM2 = {
+    "Auto Exposure Mode": 1,        # manual
+    "Auto Exposure Priority": 0,
+    "Saturation": 0,
+    "Gamma": 200,
+    "Auto Focus": 0,
+}
+_EYE_BASELINE_CAM1 = {
+    "Auto Exposure Mode": 1,
+    "Auto Exposure Priority": 0,
+    "Saturation": 0,
+    "Absolute Exposure Time": 63,
+    "Backlight Compensation": 2,
+    "Gamma": 100,
+    "Auto Focus": 0,
+}
+# Pupil sets Auto Exposure Priority to 1 on the world camera, trading frame rate
+# for exposure in changing light.  Not taken: this is a recorder, the frame rate
+# is the thing being promised, and a world video that quietly drops to 30 fps in
+# a dark room would be discovered in the timestamps afterwards.
+_WORLD_BASELINE = {
+    "Auto Focus": 0,
+}
+CONTROL_BASELINE = {
+    "Pupil Cam2 ID0": _EYE_BASELINE_CAM2, "Pupil Cam2 ID1": _EYE_BASELINE_CAM2,
+    "Pupil Cam3 ID0": _EYE_BASELINE_CAM2, "Pupil Cam3 ID1": _EYE_BASELINE_CAM2,
+    "Pupil Cam1 ID0": _EYE_BASELINE_CAM1, "Pupil Cam1 ID1": _EYE_BASELINE_CAM1,
+    "Pupil Cam1 ID2": _WORLD_BASELINE, "Pupil Cam3 ID2": _WORLD_BASELINE,
+}
+
+
+def baseline_for(product: str) -> dict[str, int]:
+    """The working point Pupil sets for this camera, or nothing for a stranger."""
+    return dict(CONTROL_BASELINE.get(product, {}))
+
+
 def _apply_order(items):
     """Automatic-mode switches first, then the values they would override.
 
@@ -127,6 +176,10 @@ class CameraStats:
     last_frame_at: float = 0.0  # unix time
     connected: bool = False
     error: str = ""
+    # Mean brightness of the middle of the picture, 0-255, or -1 before the
+    # first sample.  Pupil's own auto exposure aims for 90 to 150 on this
+    # scale, which is what makes it worth showing an operator.
+    brightness: float = -1.0
 
 
 @dataclass
@@ -349,15 +402,22 @@ class CameraWorker(threading.Thread):
                 logger.warning("%s: could not reset %s: %s", self.cam_id, name, exc)
 
     def _restore_controls(self, cap) -> None:
-        """Write the stored values into a freshly opened camera.
+        """Write the working point into a freshly opened camera.
+
+        Two layers.  First what Pupil sets for this model of camera, because a
+        camera that has just been powered on is at its factory values and those
+        are not what these sensors are meant to run at.  Then whatever the
+        operator stored here, which overrides it -- a value someone chose while
+        looking at the picture beats a default, always.
 
         A control the camera does not have, or refuses, is logged and skipped:
         losing one setting must not cost the whole stream.
         """
-        if not self.wanted_controls:
+        wanted = baseline_for(self.product) | self.wanted_controls
+        if not wanted:
             return
         by_name = {c.display_name.strip(): c for c in cap.controls}
-        for name, value in _apply_order(self.wanted_controls.items()):
+        for name, value in _apply_order(wanted.items()):
             ctrl = by_name.get(name)
             if ctrl is None:
                 logger.warning("%s: no control named %r on this camera",

@@ -28,7 +28,7 @@ import shutil
 import subprocess
 
 from .gpstrack import TrackStore
-from .preview import PreviewScaler
+from .preview import PreviewScaler, brightness_of
 from .quarantine import NoGuard
 from .tiles import TileCache
 from .recording import RecordingSession, ffmpeg_path, join_name, split_name
@@ -290,6 +290,7 @@ class AppState:
                 "frames": stats.frames,
                 "dropped_stream": stats.dropped_stream,
                 "reopens": stats.reopens,
+                "brightness": round(stats.brightness, 1),
                 "error": stats.error,
                 "recorded": counts.get(cam_id, {}).get("frames", 0),
                 "dropped_queue": counts.get(cam_id, {}).get("dropped_queue", 0),
@@ -750,8 +751,41 @@ def local_addresses(port: int) -> list[str]:
     return urls
 
 
+class BrightnessSampler(threading.Thread):
+    """Measures how bright each camera's picture is, once a second.
+
+    Not in the capture threads: those hold the GIL inside libuvc and every
+    microsecond added there is one the whole process pays.  Not per frame
+    either -- at 120 fps that would be 120 decodes a second to answer a
+    question whose answer changes with the lighting in the room.  One sample a
+    second per camera is a fraction of a millisecond each, and it is what lets
+    an operator see that an eye camera is too dark before recording rather than
+    after.
+    """
+
+    def __init__(self, workers, interval: float = 1.0):
+        super().__init__(name="brightness", daemon=True)
+        self.workers = workers
+        self.interval = interval
+        self._stop = threading.Event()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def run(self) -> None:
+        while not self._stop.wait(self.interval):
+            for worker in list(self.workers):
+                try:
+                    _, frame = worker.latest_frame(after_seq=-1, timeout=0.0)
+                    if frame is not None:
+                        worker.stats.brightness = brightness_of(frame.jpeg)
+                except Exception:
+                    logger.exception("could not measure %s", worker.cam_id)
+
+
 def serve(cfg, workers, guard=None):
     state = AppState(cfg, workers, guard)
     Handler.state = state
     httpd = Server((cfg.host, cfg.port), Handler)
+    BrightnessSampler(workers).start()
     return httpd, state
