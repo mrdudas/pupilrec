@@ -94,3 +94,27 @@ class NamingTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class PortOrderTest(unittest.TestCase):
+    """Which eye camera is `eye` and which is `eye2` comes from this order."""
+
+    def test_ten_ports_do_not_swap_the_eyes(self):
+        """As text, "3-1.10" sorts before "3-1.3"; as ports, it does not."""
+        cams = [cam("3:1", "Pupil Cam1 ID2", "3-1.1", "world"),
+                cam("3:2", "Pupil Cam2 ID0", "3-1.3", "eye"),
+                cam("3:3", "Pupil Cam2 ID1", "3-1.10", "eye")]
+        cfg = Config()
+        with mock.patch.object(usbmap, "discover_sysfs", return_value=cams):
+            workers = {w.cam_id: w.usb_path for w in build_workers(cfg)}
+        self.assertEqual(workers["left_eye"], "3-1.3")
+        self.assertEqual(workers["left_eye2"], "3-1.10")
+
+    def test_a_deep_hub_chain_still_orders_by_port(self):
+        cams = [cam("3:1", "Pupil Cam2 ID0", "3-5.4.1.2", "eye"),
+                cam("3:2", "Pupil Cam2 ID1", "3-5.4.1.12", "eye")]
+        cfg = Config()
+        with mock.patch.object(usbmap, "discover_sysfs", return_value=cams):
+            workers = {w.cam_id: w.usb_path for w in build_workers(cfg)}
+        self.assertEqual(workers["left_eye"], "3-5.4.1.2")
+        self.assertEqual(workers["left_eye2"], "3-5.4.1.12")

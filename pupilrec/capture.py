@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import queue
+import re
 import threading
 import time
 from dataclasses import dataclass, field
@@ -600,6 +601,19 @@ class CameraWorker(threading.Thread):
         self._fail_pending("camera stopped")
 
 
+def _port_order(cam):
+    """Sort key for a USB path, by number rather than by digit.
+
+    "3-1.10" sorts before "3-1.3" as text, and the order is what decides which
+    eye camera is `eye` and which is `eye2` -- so on a hub with ten or more
+    ports, plain string sorting would quietly swap the two eyes of one headset
+    between runs, with nothing in the recording to show it had happened.  No hub
+    here has that many ports; the cost of not relying on that is three lines.
+    """
+    return [int(part) if part.isdigit() else part
+            for part in re.split(r"[-.]", cam.usb_path)]
+
+
 def build_workers(cfg, guard=None) -> list[CameraWorker]:
     """Discover attached Pupil cameras and create a worker for each.
 
@@ -630,7 +644,7 @@ def build_workers(cfg, guard=None) -> list[CameraWorker]:
         # existing recordings stay comparable; further ones are numbered in USB
         # port order, which is stable across replugs.
         seen: dict[str, int] = {}
-        for cam in sorted(port_cams, key=lambda c: c.usb_path):
+        for cam in sorted(port_cams, key=_port_order):
             seen[cam.role] = seen.get(cam.role, 0) + 1
             suffix = "" if seen[cam.role] == 1 else str(seen[cam.role])
             cam_id = f"{side}_{cam.role}{suffix}"
