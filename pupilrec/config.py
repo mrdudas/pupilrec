@@ -39,8 +39,17 @@ class Config:
     # Passed to libuvc when starting a stream.  It scales the isochronous
     # bandwidth the driver reserves; the kernel's uvcvideo driver always asks
     # for the maximum, which is why two cameras of one headset cannot stream
-    # under V4L2 at all.  2.0 is pyuvc's default and measured stable here.
-    bandwidth_factor: float = 2.0
+    # under V4L2 at all.
+    #
+    # 2.0 is pyuvc's default and was right while the cameras had the bus to
+    # themselves.  They no longer do -- a dock with a keyboard, the STWIN board
+    # and a USB Ethernet adapter shares it -- and at 2.0 the fourth camera stops
+    # fitting: measured, repeatedly, on the same four cameras that ran for days.
+    # 1.2 fits all four, and six of seven when three headsets are attached, with
+    # no dropped or corrupt frames in two minutes of streaming.
+    # docs/USB-BANDWIDTH.md has the numbers and what to try when one will not
+    # come up.
+    bandwidth_factor: float = 1.2
 
     modes: dict[str, list[int]] = field(
         default_factory=lambda: {k: list(v) for k, v in DEFAULT_MODES.items()}

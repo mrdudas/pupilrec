@@ -90,6 +90,51 @@ do the job.
    isochronous stream"* and the rest hang. `pupilrec/capture.py` serialises open
    and close with a single lock. Frame grabbing runs in parallel unhindered.
 
+## The bandwidth factor is not a constant
+
+`bandwidth_factor` in `config.json` scales the isochronous bandwidth libuvc
+reserves per camera. pyuvc's default is 2.0, and how many cameras fit is decided
+by it and by *everything else on the same bus*, not by the cameras alone.
+
+Measured on this machine (2026-09-14), all headsets on the one USB 2.0 root hub:
+
+| Cameras | 2.0 | 1.2 |
+|---|---|---|
+| 7 (3 headsets, one with two eye cameras) | 5 | 6 |
+| 4 (the original pair of headsets) | 3 | 4 |
+
+The last row is the surprising one: four cameras ran for days at 2.0, and then
+stopped fitting -- because a dock had joined the bus in between, with a
+keyboard, the STWIN board and a USB Ethernet adapter on it. Periodic bandwidth
+is shared with every device on the bus, so a camera that fits today can stop
+fitting tomorrow without anything about the cameras changing.
+
+1.2 measured clean here: four cameras at their full frame rates for two
+minutes, no dropped or corrupt frames, and a recording whose videos matched
+their timestamp tables frame for frame. Lower it further only with the same
+evidence -- too small a reservation shows up as corrupt JPEGs under load, not
+as a refusal.
+
+What a camera that does not fit does *not* do is fail: it blocks inside libuvc
+with the GIL held and takes the process with it. `pupilrec/quarantine.py` is
+what keeps that from ending the recorder rather than the camera.
+
+## What to try when a camera will not come up
+
+1. `./run.py --clear-quarantine`, then restart -- a camera left out after an
+   earlier freeze stays out until something changes.
+2. Lower `bandwidth_factor` a step (2.0 -> 1.2) and restart.
+3. `sudo uhubctl -l <hub> -p <port> -a cycle -d 5` to power-cycle one port.
+   `uhubctl` with no arguments lists the hubs and what is on each port; a
+   camera showing `connect []` with no vid:pid is one the kernel never managed
+   to enumerate, which no setting in this repo can fix.
+4. Move a headset to a port on a different controller -- but check `lsusb -t`
+   first. On this NUC every USB-A socket, front and back, is the one PCH
+   controller; only the rear USB-C ports reach the Thunderbolt controller, and
+   only their SuperSpeed lanes do. A USB 2.0 device plugged in there still
+   lands on the shared bus. Splitting the cameras across controllers needs a
+   real Thunderbolt dock, whose own xHCI is tunnelled over PCIe.
+
 ## Reverting
 
 To hand the cameras back to the kernel driver:
