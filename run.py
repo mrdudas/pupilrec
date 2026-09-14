@@ -19,6 +19,7 @@ from pupilrec import systemd
 from pupilrec.capture import CameraSupervisor, build_workers
 from pupilrec.config import Config
 from pupilrec.quarantine import STATE_PATH, OpenGuard, signature_of
+from pupilrec.recording import ffmpeg_path
 from pupilrec.server import local_addresses, serve
 from pupilrec.usbmap import discover_sysfs
 
@@ -135,6 +136,14 @@ def main() -> int:
 
     watchdog.set_status(health_line)
     print(f"\n  {len(workers)} cameras streaming. Open on the iPad:")
+    # Said out loud at start-up rather than discovered at the start of a
+    # recording.  Not fatal: the preview is still worth serving, and a restart
+    # would not conjure up an ffmpeg -- so this warns and keeps going, and
+    # /api/start refuses with the same reason if anyone tries.
+    if not ffmpeg_path():
+        logging.warning("ffmpeg is not on PATH: preview works, "
+                        "recording will be refused")
+        print("  WARNING: no ffmpeg on PATH -- nothing can be recorded")
     for left_out in guard.report():
         print(f"  {left_out['id']} is left out: {left_out['reason']}."
               "  Retry with ./run.py --clear-quarantine")

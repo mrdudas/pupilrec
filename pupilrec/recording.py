@@ -16,6 +16,7 @@ import logging
 import os
 import queue
 import re
+import shutil
 import subprocess
 import threading
 import time
@@ -24,6 +25,20 @@ from datetime import datetime
 logger = logging.getLogger(__name__)
 
 CSV_HEADER = "frame_index,unix_time,iso_time,monotonic_time,device_time,uvc_index,jpeg_bytes\n"
+
+FFMPEG = "ffmpeg"
+
+
+def ffmpeg_path() -> str:
+    """Where ffmpeg is, or "" if it is not on PATH.
+
+    Worth asking before a recording rather than during one.  A recorder with no
+    ffmpeg streams, previews and reports itself healthy in every way -- and then
+    fails the moment someone presses record, which is the one moment that cannot
+    be repeated.  It happened on the macOS port, where launchd hands a daemon a
+    PATH without /usr/local/bin in it.
+    """
+    return shutil.which(FFMPEG) or ""
 
 # A recording directory is "<date>_<time>" plus an optional label.  The stamp is
 # what orders the listing and ties the directory to the times inside it, so only
@@ -87,7 +102,7 @@ class CameraSink:
 
         self._ffmpeg = subprocess.Popen(
             [
-                "ffmpeg", "-hide_banner", "-loglevel", "error",
+                FFMPEG, "-hide_banner", "-loglevel", "error",
                 "-f", "mjpeg", "-framerate", str(fps),
                 "-i", "pipe:0",
                 "-c:v", "copy",          # no transcode: the JPEGs are stored as-is

@@ -14,6 +14,7 @@ import unittest
 from unittest import mock
 
 from pupilrec.recording import join_name, safe_label, split_name
+from pupilrec import recording
 from pupilrec.server import AppState
 
 
@@ -204,3 +205,42 @@ class AdminTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class FfmpegMissingTest(unittest.TestCase):
+    """A recorder that cannot record must say so before someone presses record."""
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+        # Deliberately a path that does not exist yet: a refused start must not
+        # be the thing that creates it.
+        self.recordings = os.path.join(self.root, "recordings")
+        cfg = mock.Mock(recordings_dir=self.recordings, gps_dir=self.root,
+                        tiles_dir=self.root)
+        with mock.patch("pupilrec.server.TrackStore"), \
+             mock.patch("pupilrec.server.TileCache"):
+            self.state = AppState(cfg, [])
+
+    def test_the_path_is_empty_when_ffmpeg_is_not_installed(self):
+        with mock.patch("shutil.which", return_value=None):
+            self.assertEqual(recording.ffmpeg_path(), "")
+
+    def test_starting_is_refused_with_a_reason(self):
+        with mock.patch("pupilrec.server.ffmpeg_path", return_value=""):
+            with self.assertRaises(RuntimeError) as caught:
+                self.state.start_recording("proba")
+        self.assertIn("ffmpeg", str(caught.exception))
+
+    def test_a_refused_start_leaves_no_directory_behind(self):
+        with mock.patch("pupilrec.server.ffmpeg_path", return_value=""):
+            with self.assertRaises(RuntimeError):
+                self.state.start_recording("proba")
+        self.assertFalse(os.path.exists(self.recordings))
+
+    def test_a_refused_start_is_not_mistaken_for_a_running_one(self):
+        with mock.patch("pupilrec.server.ffmpeg_path", return_value=""):
+            with self.assertRaises(RuntimeError):
+                self.state.start_recording("proba")
+        self.assertIsNone(self.state.session)
+        self.assertEqual(self.state.status()["recording"], False)

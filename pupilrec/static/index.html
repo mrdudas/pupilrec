@@ -598,6 +598,9 @@ async function loadHealth() {
       `Új kamera a(z) ${c.port} porton (${c.product}) — újraindítás kell hozzá`)));
   (h.disconnected_cameras || []).forEach(id =>
     chips.push(chip(false, `${id}: nincs jel`)));
+  // Nothing can be recorded without it, however healthy everything else looks.
+  if (h.ffmpeg === "") chips.push(chip(false,
+    "ffmpeg nincs meg — felvétel nem indítható (az előnézet működik)"));
   // Left out on purpose: opening it froze the recorder, so this run skipped it.
   (h.quarantined_cameras || []).forEach(c =>
     chips.push(chip(false, `${c.id}: kihagyva (megfagyasztotta a felvevőt) — `

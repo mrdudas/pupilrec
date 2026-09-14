@@ -31,7 +31,7 @@ from .gpstrack import TrackStore
 from .preview import PreviewScaler
 from .quarantine import NoGuard
 from .tiles import TileCache
-from .recording import RecordingSession, join_name, split_name
+from .recording import RecordingSession, ffmpeg_path, join_name, split_name
 
 logger = logging.getLogger(__name__)
 
@@ -234,6 +234,16 @@ class AppState:
                 # Another client won the race; report the running recording
                 # rather than a bare failure, so the loser can just display it.
                 raise AlreadyRecording(self.session.name, self.started_by)
+            # Checked here so the refusal says what is wrong, before a directory
+            # is made for a recording that cannot happen.  Without it the first
+            # camera's muxer raises FileNotFoundError and the operator is told
+            # "No such file or directory: 'ffmpeg'" with an empty directory left
+            # behind.
+            if not ffmpeg_path():
+                raise RuntimeError(
+                    "ffmpeg is not installed, or not on this service's PATH, "
+                    "so nothing can be recorded. The live preview is unaffected."
+                )
             os.makedirs(self.cfg.recordings_dir, exist_ok=True)
             self.session = RecordingSession(
                 self.cfg.recordings_dir, self.workers.values(), name
@@ -638,6 +648,8 @@ class Handler(BaseHTTPRequestHandler):
                 "pupilrec-gps": self._service_state("pupilrec-gps.service"),
             },
             "pending_cameras": self.state.pending_cameras,
+            # The UI shows this before anyone presses record, not after.
+            "ffmpeg": ffmpeg_path(),
             "quarantined_cameras": self.state.guard.report(),
             "disconnected_cameras": [c["id"] for c in cameras if not c["connected"]],
             "tiles": self.state.tiles.stats(),
