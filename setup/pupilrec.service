@@ -36,6 +36,16 @@ ExecStart=/home/zsolt/aimotive/.venv/bin/python /home/zsolt/aimotive/run.py
 # costs seconds rather than waiting for someone to notice.
 NotifyAccess=main
 WatchdogSec=20
+# SIGTERM goes to this process alone, not to everything in the cgroup.  The
+# recorder muxes through one ffmpeg per camera, and the default kill mode sends
+# them the same SIGTERM at the same instant: they quit on the spot, dropping
+# whatever they had buffered, while the recorder is still asking them politely
+# to finish.  Measured on a restart mid-recording -- every video ended 3 to 10
+# frames short of its own timestamp table, the last one truncated mid-JPEG,
+# and the metadata claimed the frames were there.  With mixed, the children are
+# left to the recorder, which closes their input and waits for them; systemd
+# still SIGKILLs anything left when the stop timeout runs out.
+KillMode=mixed
 # run.py exits non-zero when it finds no cameras, so at boot this keeps retrying
 # while USB enumeration finishes instead of giving up after the default 5 tries.
 # A watchdog timeout counts as a failure here, so it restarts the same way.

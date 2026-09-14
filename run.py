@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import signal
 import sys
 import threading
@@ -160,18 +161,30 @@ def main() -> int:
         httpd.serve_forever()
     finally:
         supervisor.stop()
+        # The one thing that must finish: ffmpeg has to flush and the timestamp
+        # tables have to be written, or the recording is truncated.  It is all
+        # Python and subprocesses, with no camera call in it.
         if state.session is not None:
             logging.info("finalising the running recording")
             state.stop_recording()
         # state.workers, not the startup list: it may have grown since.
-        running = list(state.workers.values())
-        for worker in running:
-            worker.stop()
-        for worker in running:
-            worker.join(timeout=5)
+        for worker in state.workers.values():
+            worker.stop(abandon=True)
         watchdog.stop()
         httpd.server_close()
-    return 0
+        # Exit without unwinding, because unwinding means closing the cameras,
+        # and uvc_close has been seen blocking inside a usbfs ioctl with the
+        # GIL held -- twice for the full 90 seconds systemd waits before it
+        # sends SIGKILL, both times shortly after the USB topology had changed.
+        # There is nothing to gain by waiting for it: every interface, handle
+        # and descriptor this process holds is released by the kernel the
+        # moment it is gone, which is exactly what happened at the end of those
+        # 90 seconds anyway.  What a recorder owes on the way out is the
+        # recording, and that is finished above.
+        logging.shutdown()
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(0)
 
 
 if __name__ == "__main__":

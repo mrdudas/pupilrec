@@ -14,7 +14,7 @@ import unittest
 from unittest import mock
 
 from pupilrec import usbmap
-from pupilrec.capture import build_workers
+from pupilrec.capture import _ControlRequest, build_workers
 from pupilrec.config import Config
 from pupilrec.quarantine import NoGuard, OpenGuard, signature_of
 
@@ -220,3 +220,42 @@ class OpenOrderTest(unittest.TestCase):
         blocker.stop()
         self.assertTrue(waiting.open_after.wait(timeout=1),
                         "a camera stopped before opening must not strand the queue")
+
+
+class ShutdownTest(unittest.TestCase):
+    """Closing a camera is the one call on the exit path that has no bound."""
+
+    def worker(self):
+        with mock.patch.object(usbmap, "discover_sysfs",
+                               return_value=headset("3-1", eyes=0)):
+            return build_workers(Config())[0]
+
+    def test_stopping_to_exit_leaves_the_handle_alone(self):
+        worker = self.worker()
+        with mock.patch.object(type(worker), "_close") as close:
+            worker.stop(abandon=True)
+            with self.assertLogs("pupilrec.capture", level="INFO"):
+                worker._finish()
+        close.assert_not_called()
+
+    def test_stopping_to_keep_running_still_closes(self):
+        """Mid-session, the handle has to go back or the camera cannot reopen."""
+        worker = self.worker()
+        with mock.patch.object(type(worker), "_close") as close:
+            worker.stop()
+            with self.assertLogs("pupilrec.capture", level="INFO"):
+                worker._finish()
+        close.assert_called_once()
+
+    def test_a_stopped_camera_releases_anyone_waiting_on_a_control(self):
+        """However it stops: a pending control read must not hang a request."""
+        for abandon in (True, False):
+            worker = self.worker()
+            request = _ControlRequest("list")
+            worker._requests.put(request)
+            with mock.patch.object(type(worker), "_close"):
+                worker.stop(abandon=abandon)
+                with self.assertLogs("pupilrec.capture", level="INFO"):
+                    worker._finish()
+            self.assertTrue(request.done.is_set(), f"abandon={abandon}")
+            self.assertIn("stopped", request.error)

@@ -169,6 +169,7 @@ class CameraWorker(threading.Thread):
         # worker waits for `open_after` and then lets the next one go.
         self.open_after: threading.Event | None = None
         self.first_open_done = threading.Event()
+        self._abandon = False       # set by stop() when the process is exiting
 
         # Latest frame for preview.  Readers wait on the condition for a new
         # sequence number rather than polling, so an idle preview costs nothing.
@@ -369,7 +370,14 @@ class CameraWorker(threading.Thread):
 
     # -- lifecycle -------------------------------------------------------
 
-    def stop(self) -> None:
+    def stop(self, abandon: bool = False) -> None:
+        """Ask this camera to stop.
+
+        `abandon` leaves the capture handle open on the way out, for a process
+        that is about to exit: closing it is the one call on the shutdown path
+        with no bound on how long it takes.  See run.py.
+        """
+        self._abandon = abandon
         self._stop.set()
         # A camera stopped before it ever opened must not strand the ones
         # queued behind it.
@@ -574,9 +582,22 @@ class CameraWorker(threading.Thread):
                 self._seq += 1
                 self._new_frame.notify_all()
 
-        self._close()
+        self._finish()
+
+    def _finish(self) -> None:
+        """The last thing the capture thread does, once it is not running."""
+        if self._abandon:
+            # The process is on its way out and the kernel releases every USB
+            # interface it held.  Doing it here instead means uvc_close, which
+            # has been measured taking the whole of systemd's 90s stop timeout
+            # with the GIL in its hand -- and a shutdown that slow is one that
+            # ends in SIGKILL, which is worse than not closing at all.
+            logger.info("%s: stopped after %d frames, leaving the handle to "
+                        "the kernel", self.cam_id, self.stats.frames)
+        else:
+            self._close()
+            logger.info("%s: stopped after %d frames", self.cam_id, self.stats.frames)
         self._fail_pending("camera stopped")
-        logger.info("%s: stopped after %d frames", self.cam_id, self.stats.frames)
 
 
 def build_workers(cfg, guard=None) -> list[CameraWorker]:
