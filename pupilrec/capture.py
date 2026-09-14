@@ -15,12 +15,20 @@ from dataclasses import dataclass, field
 
 import uvc
 
+from . import systemd
+from .quarantine import NoGuard
+
 logger = logging.getLogger(__name__)
 
 # libuvc hands back a view into a buffer it reuses on the next call, so a frame
 # has to be copied before asking for the following one.  This is the only copy.
 GRAB_TIMEOUT = 1.0        # seconds; bounds how long stop() waits on a dead camera
-REOPEN_DELAY = 2.0        # seconds between reconnect attempts
+REOPEN_DELAY = 2.0        # seconds before the first reconnect attempt
+# A camera that cannot be opened at all -- no bandwidth left on the bus, a
+# board in a bad state -- would otherwise retry twice a second forever, and
+# each attempt takes the device lock and the GIL for up to FIRST_FRAME_TIMEOUT.
+# That is a stall the healthy cameras pay for, so failures back off.
+MAX_REOPEN_DELAY = 60.0
 # A camera that has been unplugged does not raise; it simply stops delivering,
 # and libuvc keeps timing out.  Without a deadline the worker would report a
 # healthy camera forever and record an empty video.
@@ -138,7 +146,7 @@ class CameraWorker(threading.Thread):
     def __init__(self, cam_id: str, uid: str, role: str, side: str,
                  usb_path: str, product: str,
                  width: int, height: int, fps: int, bandwidth_factor: float,
-                 controls: dict[str, int] | None = None):
+                 controls: dict[str, int] | None = None, guard=None):
         super().__init__(name=f"cam-{cam_id}", daemon=True)
         self.cam_id = cam_id
         self.uid = uid
@@ -153,6 +161,14 @@ class CameraWorker(threading.Thread):
         self._stop = threading.Event()
         self._cap = None
         self._last_frame_mono = 0.0
+        # Names this camera on disk while it is being opened, so that a freeze
+        # inside libuvc is attributable after the kill.  See quarantine.py.
+        self.guard = guard if guard is not None else NoGuard()
+        self._open_failures = 0
+        # Cameras open one at a time, in an order set by build_workers: this
+        # worker waits for `open_after` and then lets the next one go.
+        self.open_after: threading.Event | None = None
+        self.first_open_done = threading.Event()
 
         # Latest frame for preview.  Readers wait on the condition for a new
         # sequence number rather than polling, so an idle preview costs nothing.
@@ -355,6 +371,9 @@ class CameraWorker(threading.Thread):
 
     def stop(self) -> None:
         self._stop.set()
+        # A camera stopped before it ever opened must not strand the ones
+        # queued behind it.
+        self.first_open_done.set()
 
     def _resolve_uid(self) -> str:
         """Find the camera's current libuvc uid from its physical port.
@@ -376,7 +395,9 @@ class CameraWorker(threading.Thread):
         if uid != self.uid:
             logger.info("%s: moved from uid %s to %s", self.cam_id, self.uid, uid)
             self.uid = uid
-        with _device_lock:
+        with _device_lock, self.guard.attempting(self.cam_id, self.usb_path):
+            # Everything from here to the first frame can freeze the process
+            # rather than fail, which is why the note is written first.
             cap = uvc.Capture(self.uid)
             try:
                 cap.bandwidth_factor = self.bandwidth_factor
@@ -419,9 +440,15 @@ class CameraWorker(threading.Thread):
         self._last_frame_mono = time.monotonic()
         self.stats.connected = True
         self.stats.error = ""
+        self._open_failures = 0
         logger.info("%s: streaming %dx%d@%d (uid %s, usb %s)",
                     self.cam_id, self.width, self.height, self.fps,
                     self.uid, self.usb_path)
+        # Opening cameras is serialised and each one holds the GIL throughout,
+        # so with enough of them the watchdog thread never gets to run before
+        # systemd's patience runs out.  One camera opened is progress worth
+        # reporting in its own right.
+        systemd.ping()
 
     def _device_vanished(self) -> bool:
         """True when the device this handle refers to is no longer on the bus.
@@ -474,16 +501,24 @@ class CameraWorker(threading.Thread):
             self._serve_requests()
 
             if self._cap is None:
+                if self.open_after is not None and not self.first_open_done.is_set():
+                    self.open_after.wait()
                 try:
                     self._open()
                 except Exception as exc:
                     self.stats.error = str(exc)
                     self.stats.connected = False
-                    logger.error("%s: open failed: %s", self.cam_id, exc)
-                    if self._stop.wait(REOPEN_DELAY):
+                    self._open_failures += 1
+                    delay = min(REOPEN_DELAY * 2 ** (self._open_failures - 1),
+                                MAX_REOPEN_DELAY)
+                    logger.error("%s: open failed: %s (retry in %.0fs)",
+                                 self.cam_id, exc, delay)
+                    self.first_open_done.set()    # never hold up the next camera
+                    if self._stop.wait(delay):
                         break
                     self.stats.reopens += 1
                     continue
+                self.first_open_done.set()
 
             try:
                 frame = self._cap.get_frame(timeout=GRAB_TIMEOUT)
@@ -544,8 +579,14 @@ class CameraWorker(threading.Thread):
         logger.info("%s: stopped after %d frames", self.cam_id, self.stats.frames)
 
 
-def build_workers(cfg) -> list[CameraWorker]:
-    """Discover attached Pupil cameras and create a worker for each."""
+def build_workers(cfg, guard=None) -> list[CameraWorker]:
+    """Discover attached Pupil cameras and create a worker for each.
+
+    A camera the guard has condemned gets no worker at all: it froze the
+    recorder the last time it was opened, and opening it again would do the
+    same.  Everything else comes up as usual, which is the point -- one camera
+    the bus cannot carry must cost that camera, not the recording.
+    """
     from .usbmap import discover_sysfs, group_by_port
 
     # sysfs, not libuvc: see discover_sysfs for why enumerating through the
@@ -556,6 +597,9 @@ def build_workers(cfg) -> list[CameraWorker]:
             "No Pupil Core cameras found. Are they plugged in, and has "
             "uvcvideo been detached (see setup/install.sh)?"
         )
+    guard = guard if guard is not None else NoGuard()
+    for gone in cfg.forget_absent_headsets({cam.root_port for cam in cams}):
+        logger.info("forgetting the label for %s: nothing is plugged into it", gone)
 
     workers = []
     for index, (root_port, port_cams) in enumerate(sorted(group_by_port(cams).items())):
@@ -569,6 +613,10 @@ def build_workers(cfg) -> list[CameraWorker]:
             seen[cam.role] = seen.get(cam.role, 0) + 1
             suffix = "" if seen[cam.role] == 1 else str(seen[cam.role])
             cam_id = f"{side}_{cam.role}{suffix}"
+            if guard.is_quarantined(cam_id):
+                logger.warning("%s at %s is left out: it froze the recorder "
+                               "when it was last opened", cam_id, cam.usb_path)
+                continue
             width, height, fps = cfg.mode_for(cam.role)
             workers.append(CameraWorker(
                 cam_id=cam_id,
@@ -577,7 +625,19 @@ def build_workers(cfg) -> list[CameraWorker]:
                 width=width, height=height, fps=fps,
                 bandwidth_factor=cfg.bandwidth_factor,
                 controls=cfg.controls_for(cam_id),
+                guard=guard,
             ))
+    # Open the world cameras first, one camera at a time.  When the bus runs out
+    # of bandwidth it is whichever camera is being opened that wedges, so this
+    # order decides what is lost: an eye camera rather than a headset's main
+    # view.  Seven cameras do not fit on one USB 2.0 bus and six do, and which
+    # six should not be decided by whichever thread won the race.
+    previous = None
+    for worker in sorted(workers,
+                         key=lambda w: (w.role != "world", w.side, w.usb_path)):
+        worker.open_after = previous
+        previous = worker.first_open_done
+
     return sorted(workers, key=lambda w: (w.side, w.role, w.usb_path))
 
 

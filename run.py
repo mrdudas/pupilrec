@@ -17,7 +17,9 @@ import threading
 from pupilrec import systemd
 from pupilrec.capture import CameraSupervisor, build_workers
 from pupilrec.config import Config
+from pupilrec.quarantine import STATE_PATH, OpenGuard, signature_of
 from pupilrec.server import local_addresses, serve
+from pupilrec.usbmap import discover_sysfs
 
 
 def parse_args():
@@ -31,6 +33,9 @@ def parse_args():
                    help="list the attached cameras and exit")
     p.add_argument("--swap-sides", action="store_true",
                    help="swap which front port is labelled left and right, then exit")
+    p.add_argument("--clear-quarantine", action="store_true",
+                   help="try every camera again, including one left out after "
+                        "it froze the recorder, then exit")
     p.add_argument("-v", "--verbose", action="store_true")
     return p.parse_args()
 
@@ -76,8 +81,22 @@ def main() -> int:
             print(f"  USB port {port} -> {side}")
         return 0
 
+    # What was learned about this exact set of cameras last time: which one, if
+    # any, froze the recorder while being opened.  It is keyed by the set, so
+    # moving a headset to another port retries everything by itself.
+    guard = OpenGuard(STATE_PATH, signature_of(discover_sysfs()))
+
+    if args.clear_quarantine:
+        watchdog.stop()
+        released = guard.clear()
+        print("Every camera will be tried again."
+              if released else "Nothing was being left out.")
+        for cam_id in released:
+            print(f"  {cam_id}")
+        return 0
+
     try:
-        workers = build_workers(cfg)
+        workers = build_workers(cfg, guard)
     except RuntimeError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
@@ -93,7 +112,7 @@ def main() -> int:
     for worker in workers:
         worker.start()
 
-    httpd, state = serve(cfg, workers)
+    httpd, state = serve(cfg, workers, guard)
 
     # Headsets are optional and may be plugged in later.  The supervisor cannot
     # start such a camera itself, but it can say one is waiting.
@@ -115,6 +134,9 @@ def main() -> int:
 
     watchdog.set_status(health_line)
     print(f"\n  {len(workers)} cameras streaming. Open on the iPad:")
+    for left_out in guard.report():
+        print(f"  {left_out['id']} is left out: {left_out['reason']}."
+              "  Retry with ./run.py --clear-quarantine")
     for url in local_addresses(cfg.port):
         print(f"    {url}")
     print("\n  Ctrl-C to stop.\n")

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import asdict, dataclass, field
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -116,12 +117,41 @@ class Config:
         # Never hand out a label already taken by another port.
         taken = set(self.headsets.values())
         if side in taken:
-            n = fallback_index + 1
+            # Count past every headset already known, not just past this one's
+            # position: a third headset discovered after the other two were
+            # labelled would otherwise be offered "unit2", which reads as the
+            # second of something and belongs to nothing.
+            n = max(fallback_index + 1, len(taken) + 1)
             while f"unit{n}" in taken:
                 n += 1
             side = f"unit{n}"
         self.headsets[root_port] = side
         return side
+
+    def forget_absent_headsets(self, attached_ports) -> list[str]:
+        """Drop generated labels for ports with nothing plugged into them.
+
+        A headset moved to another socket arrives as a new port and takes a new
+        label, leaving the old one behind pointing at an empty one.  Do that
+        three times while hunting for a USB port with bandwidth to spare -- as
+        happened here -- and the third headset is called "unit4", which names
+        nothing.
+
+        Only generated "unitN" labels are dropped, and only when no camera
+        setting is stored under them.  A name someone chose, and a headset whose
+        image controls are remembered, are kept while unplugged: outlasting a
+        pulled cable is what this file is for.
+        """
+        attached = set(attached_ports)
+        dropped = []
+        for port, side in sorted(self.headsets.items()):
+            if port in attached or not re.fullmatch(r"unit\d+", side):
+                continue
+            if any(key.startswith(f"{side}_") for key in self.camera_controls):
+                continue
+            del self.headsets[port]
+            dropped.append(f"{port} ({side})")
+        return dropped
 
     def save(self, path: str = CONFIG_PATH) -> None:
         with open(path, "w") as fh:

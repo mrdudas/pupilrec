@@ -65,11 +65,12 @@
     text-transform: uppercase; letter-spacing: .09em; color: var(--muted);
     border-bottom: 1px solid var(--line);
   }
-  .cams { display: grid; grid-template-columns: 3fr 1fr; gap: 1px; background: var(--line); }
-  /* A headset with two eye cameras: the world view keeps its width, the eye
-     views share the remaining column. */
-  .cams.eyes-2 { grid-template-columns: 3fr 1fr 1fr; }
-  .cams.eyes-3 { grid-template-columns: 3fr 1fr 1fr 1fr; }
+  /* One column per camera: a wide one for each world view, a narrow one for
+     each eye.  --cols is set from what the headset actually reports, so two eye
+     cameras, one, or none all lay out without a gap left over.  The narrow
+     screen rule sets the property itself, which is why --cols is a variable and
+     not an inline grid-template-columns -- an inline style would win over it. */
+  .cams { display: grid; grid-template-columns: var(--cols, 3fr 1fr); gap: 1px; background: var(--line); }
   @media (max-width: 720px) { .cams { grid-template-columns: 1fr; } }
   .cam { background: var(--panel); display: flex; flex-direction: column; }
   .cam figure { margin: 0; background: #000; aspect-ratio: 16 / 9; display: grid; place-items: center; }
@@ -308,7 +309,7 @@ const CLIENT_ID = (() => {
   return id;
 })();
 
-let built = false;
+let builtFor = "";            // the camera set the grid was laid out for
 let online = false;
 let offlineSince = 0;
 let lastVersion = null;     // server state_version seen so far
@@ -408,6 +409,14 @@ setInterval(() => {
 
 /* ---- layout ----------------------------------------------------------- */
 
+/* Which cameras are present, in a form two polls can be compared by.  A headset
+   plugged in or taken away changes this, and the grid is rebuilt -- an operator
+   who restarts the recorder from the tablet should not have to reload the page
+   to see the camera they just connected. */
+function cameraSet(cameras) {
+  return cameras.map(c => c.id).sort().join(",");
+}
+
 function build(cameras) {
   const bySide = {};
   cameras.forEach(c => (bySide[c.side] = bySide[c.side] || []).push(c));
@@ -419,8 +428,10 @@ function build(cameras) {
     section.className = "headset";
     section.innerHTML = `<h2>${headsetLabel(side)}</h2><div class="cams"></div>`;
     const cams = section.querySelector(".cams");
-    const eyeCount = bySide[side].filter(c => c.role === "eye").length;
-    if (eyeCount > 1) cams.classList.add(`eyes-${Math.min(eyeCount, 3)}`);
+    const cols = bySide[side]
+      .map(c => c.role === "world" ? "3fr" : "1fr")
+      .sort((a, b) => a === "3fr" ? -1 : 1);          // world views first
+    cams.style.setProperty("--cols", cols.join(" "));
 
     bySide[side].sort((a, b) => a.role === "world" ? -1 : 1).forEach(cam => {
       const div = document.createElement("div");
@@ -441,7 +452,7 @@ function build(cameras) {
     });
     grid.appendChild(section);
   });
-  built = true;
+  builtFor = cameraSet(cameras);
 }
 
 function fmtDuration(s) {
@@ -496,7 +507,7 @@ async function refresh() {
     (viewers > 1 ? ` · ${viewers} néző` : "");
 
   cameras = st.cameras;
-  if (!built && st.cameras.length) build(st.cameras);
+  if (st.cameras.length && cameraSet(st.cameras) !== builtFor) build(st.cameras);
 
   // Announce changes another client made, but only once per change and never
   // for our own action (which already showed its own confirmation).
@@ -587,6 +598,10 @@ async function loadHealth() {
       `Új kamera a(z) ${c.port} porton (${c.product}) — újraindítás kell hozzá`)));
   (h.disconnected_cameras || []).forEach(id =>
     chips.push(chip(false, `${id}: nincs jel`)));
+  // Left out on purpose: opening it froze the recorder, so this run skipped it.
+  (h.quarantined_cameras || []).forEach(c =>
+    chips.push(chip(false, `${c.id}: kihagyva (megfagyasztotta a felvevőt) — `
+                         + `újrapróba: ./run.py --clear-quarantine`)));
 
   // The GNSS receiver is optional, so "not attached" is neutral, not an alarm.
   const g = h.gps || {};

@@ -29,6 +29,7 @@ import subprocess
 
 from .gpstrack import TrackStore
 from .preview import PreviewScaler
+from .quarantine import NoGuard
 from .tiles import TileCache
 from .recording import RecordingSession, join_name, split_name
 
@@ -74,9 +75,12 @@ class AppState:
     without any of them disagreeing about whether a recording is running.
     """
 
-    def __init__(self, cfg, workers):
+    def __init__(self, cfg, workers, guard=None):
         self.cfg = cfg
         self.workers = {w.cam_id: w for w in workers}
+        # Cameras left out of this run because they froze the last one.  They
+        # have no worker, so nothing else in here would know they exist.
+        self.guard = guard if guard is not None else NoGuard()
         self.session: RecordingSession | None = None
         self.lock = threading.Lock()
         self.last_result: dict | None = None
@@ -634,6 +638,7 @@ class Handler(BaseHTTPRequestHandler):
                 "pupilrec-gps": self._service_state("pupilrec-gps.service"),
             },
             "pending_cameras": self.state.pending_cameras,
+            "quarantined_cameras": self.state.guard.report(),
             "disconnected_cameras": [c["id"] for c in cameras if not c["connected"]],
             "tiles": self.state.tiles.stats(),
             "recovery_available": os.access(RECOVER_HELPER, os.X_OK),
@@ -733,8 +738,8 @@ def local_addresses(port: int) -> list[str]:
     return urls
 
 
-def serve(cfg, workers):
-    state = AppState(cfg, workers)
+def serve(cfg, workers, guard=None):
+    state = AppState(cfg, workers, guard)
     Handler.state = state
     httpd = Server((cfg.host, cfg.port), Handler)
     return httpd, state

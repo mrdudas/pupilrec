@@ -87,6 +87,22 @@ def notify(message: str) -> None:
     _notifier.send(message)
 
 
+def ping() -> None:
+    """Report progress from a thread that is holding the GIL for a long time.
+
+    The Watchdog thread below is the honest liveness test, but it cannot run
+    while a capture thread is inside libuvc -- and opening cameras is exactly
+    that, serialised, for as long as it takes each one.  Four cameras fit
+    inside WatchdogSec; seven do not, and the recorder was killed mid-start for
+    that reason alone, with nothing actually wrong.
+
+    So the open path says so itself, once per camera.  This does not weaken the
+    watchdog: a ping still means Python ran, and the interval it has to run in
+    is now "one camera opened" rather than "all of them did".
+    """
+    notify("WATCHDOG=1")
+
+
 def clear_environment() -> None:
     """Stop child processes from notifying systemd on this service's behalf.
 
