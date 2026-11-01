@@ -64,7 +64,14 @@ echo "==> pyuvc (from git, to match libuvc)"
 if [ ! -d "${BUILD}/pyuvc" ]; then
     git clone --depth 1 https://github.com/pupil-labs/pyuvc "${BUILD}/pyuvc"
 fi
-PKG_CONFIG_PATH=/usr/local/lib/pkgconfig ./.venv/bin/pip install "${BUILD}/pyuvc"
+# FORCE_LOCAL_LIBUVC_BUILD=OFF: pyuvc's setup.py defaults it to ON, which builds
+# its own libuvc from a git submodule -- absent from this shallow clone, so the
+# build fails.  Link against the libuvc installed above instead.
+# _skbuild is scikit-build's CMake cache inside the clone; after a failed run it
+# points at pip's deleted temporary build env and every retry fails on Cython.
+rm -rf "${BUILD}/pyuvc/_skbuild"
+FORCE_LOCAL_LIBUVC_BUILD=OFF PKG_CONFIG_PATH=/usr/local/lib/pkgconfig \
+    ./.venv/bin/pip install "${BUILD}/pyuvc"
 
 # The STWIN board is driven through ST's prebuilt library.  Only the v2 one
 # works: v1 hardcodes USB product id 0x5743 and reports zero devices for a
@@ -90,8 +97,26 @@ sudo install -m 0644 "${ROOT}/setup/70-pupil-cams.rules" /etc/udev/rules.d/
 sudo install -m 0644 "${ROOT}/setup/71-stwin-datalog.rules" /etc/udev/rules.d/
 sudo install -m 0644 "${ROOT}/setup/72-ublox-gps.rules" /etc/udev/rules.d/
 sudo udevadm control --reload-rules
-sudo udevadm trigger --subsystem-match=usb --action=add
+# tty too: the GPS rule matches the serial port, not the USB device, so a
+# receiver already plugged in would otherwise keep root:dialout until replugged.
+sudo udevadm trigger --subsystem-match=usb --subsystem-match=tty --action=add
 sleep 2
+
+# The unit files in setup/ name the original rig's checkout and user; install
+# them pointing at this checkout and whoever is running the installer.
+# Enabled now, started at the end so the recorder does not hold the cameras
+# while --list looks at them.
+echo "==> systemd services"
+SERVICES="pupilrec pupilrec-sensors pupilrec-gps"
+for unit in $SERVICES; do
+    sed -e "s#/home/zsolt/aimotive#${ROOT}#g" \
+        -e "s#^User=.*#User=$(id -un)#" \
+        "${ROOT}/setup/${unit}.service" |
+        sudo tee "/etc/systemd/system/${unit}.service" > /dev/null
+done
+sudo systemctl daemon-reload
+# shellcheck disable=SC2086
+sudo systemctl enable $SERVICES
 
 echo
 echo "==> Cameras found:"
@@ -99,5 +124,10 @@ echo "==> Cameras found:"
     echo "No cameras detected. Plug the headsets in and re-run: ./run.py --list" >&2
     exit 1
 }
+
+echo "==> Starting services"
+# shellcheck disable=SC2086
+sudo systemctl restart $SERVICES
 echo
-echo "Done.  Start the server with:  ./run.py"
+echo "Done.  The recorder runs as a service on port 8080:"
+echo "  systemctl status pupilrec pupilrec-sensors pupilrec-gps"
