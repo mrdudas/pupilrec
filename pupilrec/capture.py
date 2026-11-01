@@ -35,6 +35,26 @@ MAX_REOPEN_DELAY = 60.0
 # healthy camera forever and record an empty video.
 STALL_TIMEOUT = 3.0       # seconds without a frame before declaring it gone
 FIRST_FRAME_TIMEOUT = 4.0  # bounds the one call that could otherwise never return
+# A camera that has gone is waited for by watching its port in sysfs, which
+# costs nothing and touches no libusb state.  When it reappears, the hub and
+# the kernel are still settling for a moment -- descriptors being read, the
+# other functions of the device binding -- and opening into the middle of that
+# is the kind of open that wedges.  So a returning camera is given a short
+# while to be there before anything talks to it.
+PRESENCE_POLL = 1.0       # seconds between looks at the port while it is empty
+SETTLE_TIME = 2.0         # seconds a returning camera must be present first
+# A camera has to stream this long after an open before its failures are
+# forgotten.  Without it, one that opens, delivers a frame and stalls again
+# would be reopened every few seconds forever, holding the GIL for each open.
+HEALTHY_AFTER = 10.0
+
+# Capture handles whose device disappeared under them.  pyuvc's __dealloc__
+# calls close(), which is exactly the call that blocks with the GIL held on a
+# handle whose device is gone -- so letting the last reference drop would run
+# the very close that abandoning the handle exists to avoid, just a moment
+# later, from wherever the garbage collector happens to be.  Each one costs a
+# file descriptor and a little memory until the process exits.
+_abandoned_handles: list = []
 
 # libuvc shares one libusb context across all cameras, and opening or closing a
 # device from several threads at once races inside it: the symptom is one camera
@@ -219,6 +239,12 @@ class CameraWorker(threading.Thread):
         # inside libuvc is attributable after the kill.  See quarantine.py.
         self.guard = guard if guard is not None else NoGuard()
         self._open_failures = 0
+        self._retry_at = 0.0        # monotonic time before which no reopen
+        self._opened_mono = 0.0     # when the current handle was opened
+        self._ever_opened = False   # the first open is start-up, later ones are not
+        # The uid last seen at the port and since when, for SETTLE_TIME.
+        self._seen_uid = uid
+        self._seen_since = 0.0
         # Cameras open one at a time, in an order set by build_workers: this
         # worker waits for `open_after` and then lets the next one go.
         self.open_after: threading.Event | None = None
@@ -464,7 +490,8 @@ class CameraWorker(threading.Thread):
         if uid != self.uid:
             logger.info("%s: moved from uid %s to %s", self.cam_id, self.uid, uid)
             self.uid = uid
-        with _device_lock, self.guard.attempting(self.cam_id, self.usb_path):
+        phase = "reopen" if self._ever_opened else "start"
+        with _device_lock, self.guard.attempting(self.cam_id, self.usb_path, phase):
             # Everything from here to the first frame can freeze the process
             # rather than fail, which is why the note is written first.
             cap = uvc.Capture(self.uid)
@@ -503,13 +530,17 @@ class CameraWorker(threading.Thread):
                 # recorder unresponsive until it was killed.
                 self._restore_controls(cap)
             except Exception:
-                cap.close()
+                if self._device_vanished():
+                    # Pulled out mid-open: closing would block (see _close).
+                    _abandoned_handles.append(cap)
+                else:
+                    cap.close()
                 raise
         self._cap = cap
-        self._last_frame_mono = time.monotonic()
+        self._ever_opened = True
+        self._opened_mono = self._last_frame_mono = time.monotonic()
         self.stats.connected = True
         self.stats.error = ""
-        self._open_failures = 0
         logger.info("%s: streaming %dx%d@%d (uid %s, usb %s)",
                     self.cam_id, self.width, self.height, self.fps,
                     self.uid, self.usb_path)
@@ -550,6 +581,10 @@ class CameraWorker(threading.Thread):
             # turned into a ninety second outage.  So the handle is abandoned
             # instead.  It costs a file descriptor until the process exits, and
             # the port is opened from scratch next time regardless.
+            #
+            # "Abandoned" has to mean a reference is kept: dropping it would
+            # let pyuvc's __dealloc__ run the same close a moment later.
+            _abandoned_handles.append(cap)
             logger.warning("%s: device at %s is gone (was uid %s); abandoning "
                            "the handle rather than blocking on close",
                            self.cam_id, self.usb_path, self.uid)
@@ -559,6 +594,97 @@ class CameraWorker(threading.Thread):
                 cap.close()
         except Exception:
             logger.exception("%s: error closing capture", self.cam_id)
+
+    def _device_ready(self) -> bool:
+        """Whether there is a camera at our port that may be opened now.
+
+        Pure sysfs, so it is safe to ask as often as needed.  A camera at the
+        uid it was last opened at -- start-up, or one that stalled without
+        leaving the bus -- is ready at once.  One at a new uid has just been
+        plugged back in, or its hub re-enumerated it, and must have been there
+        for SETTLE_TIME first.
+        """
+        now = time.monotonic()
+        try:
+            uid = self._resolve_uid()
+        except RuntimeError:
+            if self._seen_uid is not None:
+                logger.warning("%s: unplugged; waiting for it at USB port %s",
+                               self.cam_id, self.usb_path)
+            self._seen_uid = None
+            self.stats.connected = False
+            self.stats.error = f"unplugged (waiting at USB port {self.usb_path})"
+            return False
+        except Exception:
+            logger.exception("%s: could not look for the device", self.cam_id)
+            return False
+        if uid != self._seen_uid:
+            if self._seen_uid is None:
+                logger.info("%s: back at USB port %s (uid %s)",
+                            self.cam_id, self.usb_path, uid)
+            self._seen_uid, self._seen_since = uid, now
+        if uid == self.uid:
+            return True
+        if now - self._seen_since < SETTLE_TIME:
+            self.stats.error = "plugged back in; settling"
+            return False
+        return True
+
+    def _schedule_retry(self, reason: str) -> None:
+        """Back off before the next open, longer each time it fails again."""
+        self._open_failures += 1
+        delay = min(REOPEN_DELAY * 2 ** (self._open_failures - 1),
+                    MAX_REOPEN_DELAY)
+        self._retry_at = time.monotonic() + delay
+        logger.error("%s: %s (retry in %.0fs)", self.cam_id, reason, delay)
+
+    def _try_open(self) -> bool:
+        """One step towards an open handle. -> True once there is one.
+
+        Never sleeps for long: it returns so the loop can serve control
+        requests (with a prompt "not open" rather than a 12 s timeout) and
+        notice stop() in between.
+        """
+        if self.open_after is not None and not self.first_open_done.is_set():
+            self.open_after.wait()
+        try:
+            wait = self._retry_at - time.monotonic()
+            if wait > 0:
+                self._stop.wait(min(wait, PRESENCE_POLL))
+                return False
+            if not self._device_ready():
+                self._stop.wait(PRESENCE_POLL)
+                return False
+            try:
+                self._open()
+            except Exception as exc:
+                self.stats.error = str(exc)
+                self.stats.connected = False
+                self._schedule_retry(f"open failed: {exc}")
+                return False
+            return True
+        finally:
+            # Whatever came of it, never hold up the next camera in the chain.
+            self.first_open_done.set()
+
+    def _give_up_handle(self, reason: str) -> None:
+        """Drop the current handle so the loop opens the camera again.
+
+        A camera that stalls while still on the bus at the same address is
+        reopened after a back-off, counted like a failed open, so a camera that
+        keeps stalling straight after each open cannot monopolise the GIL.  One
+        that left the bus is simply waited for: nothing is spent until sysfs
+        shows it back.
+        """
+        vanished = self._device_vanished()
+        self.stats.reopens += 1
+        self.stats.connected = False
+        self.stats.error = reason
+        self._close()
+        if not vanished:
+            self._schedule_retry(f"{reason}; reopening")
+        else:
+            logger.warning("%s: %s; will reopen when it is back", self.cam_id, reason)
 
     def run(self) -> None:
         window_start = time.monotonic()
@@ -570,47 +696,38 @@ class CameraWorker(threading.Thread):
             self._serve_requests()
 
             if self._cap is None:
-                if self.open_after is not None and not self.first_open_done.is_set():
-                    self.open_after.wait()
-                try:
-                    self._open()
-                except Exception as exc:
-                    self.stats.error = str(exc)
-                    self.stats.connected = False
-                    self._open_failures += 1
-                    delay = min(REOPEN_DELAY * 2 ** (self._open_failures - 1),
-                                MAX_REOPEN_DELAY)
-                    logger.error("%s: open failed: %s (retry in %.0fs)",
-                                 self.cam_id, exc, delay)
-                    self.first_open_done.set()    # never hold up the next camera
-                    if self._stop.wait(delay):
-                        break
-                    self.stats.reopens += 1
+                if not self._try_open():
                     continue
-                self.first_open_done.set()
+                window_start, window_frames = time.monotonic(), 0
 
             try:
                 frame = self._cap.get_frame(timeout=GRAB_TIMEOUT)
             except TimeoutError:
                 self.stats.timeouts += 1
                 silent = time.monotonic() - self._last_frame_mono
-                if silent > STALL_TIMEOUT and self.stats.connected:
-                    # Report it, but do not try to reopen: see CameraSupervisor
-                    # for why opening a camera mid-session is not safe here.
-                    self.stats.connected = False
-                    self.stats.error = f"no frames for {silent:.0f}s"
-                    logger.warning("%s: %s", self.cam_id, self.stats.error)
+                if silent > STALL_TIMEOUT:
+                    # An unplugged camera does not raise, it just stops
+                    # delivering.  The recording keeps running for every other
+                    # camera; this one rejoins it once it is back.
+                    logger.warning("%s: no frames for %.0fs", self.cam_id, silent)
+                    self.stats.fps = 0.0
+                    self._give_up_handle(f"no frames for {silent:.0f}s")
                 continue
             except uvc.StreamError as exc:
                 # Corrupt or truncated frame -- pyuvc already rejected it.
                 self.stats.dropped_stream += 1
                 if self.stats.dropped_stream % 100 == 1:
                     logger.warning("%s: stream error: %s", self.cam_id, exc)
+                # A stream that only ever produces errors is as dead as a
+                # silent one, and must not spin here forever either.
+                silent = time.monotonic() - self._last_frame_mono
+                if silent > STALL_TIMEOUT:
+                    self.stats.fps = 0.0
+                    self._give_up_handle(f"only stream errors for {silent:.0f}s")
                 continue
             except Exception as exc:
-                self.stats.error = str(exc)
                 logger.error("%s: capture failed, reopening: %s", self.cam_id, exc)
-                self._close()
+                self._give_up_handle(str(exc))
                 continue
 
             now = time.time()
@@ -627,6 +744,9 @@ class CameraWorker(threading.Thread):
             self.stats.frames += 1
             self.stats.last_frame_at = now
             self._last_frame_mono = record.monotonic
+            if (self._open_failures
+                    and record.monotonic - self._opened_mono > HEALTHY_AFTER):
+                self._open_failures = 0
             window_frames += 1
             elapsed = record.monotonic - window_start
             if elapsed >= 1.0:
@@ -674,20 +794,28 @@ def _port_order(cam):
             for part in re.split(r"[-.]", cam.usb_path)]
 
 
-def build_workers(cfg, guard=None) -> list[CameraWorker]:
+def build_workers(cfg, guard=None, expected=None) -> list[CameraWorker]:
     """Discover attached Pupil cameras and create a worker for each.
 
     A camera the guard has condemned gets no worker at all: it froze the
     recorder the last time it was opened, and opening it again would do the
     same.  Everything else comes up as usual, which is the point -- one camera
     the bus cannot carry must cost that camera, not the recording.
+
+    `expected` lists cameras that must have a worker whether or not they are
+    attached right now: those of a recording being resumed after a restart
+    (recording.json's "cameras").  One that is missing -- unplugged, which may
+    well be what brought the last run down -- gets a worker that waits at its
+    port and joins the recording when it is plugged back in, under the name it
+    had, instead of needing yet another restart that would cut the recording.
     """
     from .usbmap import discover_sysfs, group_by_port
 
     # sysfs, not libuvc: see discover_sysfs for why enumerating through the
     # library is not safe once cameras are streaming.
     cams = discover_sysfs()
-    if not cams:
+    expected = list(expected or [])
+    if not cams and not expected:
         raise RuntimeError(
             "No Pupil Core cameras found. Are they plugged in, and has "
             "uvcvideo been detached (see setup/install.sh)?"
@@ -722,6 +850,28 @@ def build_workers(cfg, guard=None) -> list[CameraWorker]:
                 controls=cfg.controls_for(cam_id),
                 guard=guard,
             ))
+    present = {w.usb_path for w in workers} | {w.cam_id for w in workers}
+    for cam in expected:
+        cam_id, usb_path = cam.get("camera"), cam.get("usb_path")
+        role = cam.get("role")
+        if not cam_id or not usb_path or role not in ("world", "eye"):
+            continue
+        if usb_path in present or cam_id in present:
+            continue            # attached, or its name is taken: nothing to wait for
+        if guard.is_quarantined(cam_id):
+            continue
+        width, height, fps = cfg.mode_for(role)
+        logger.warning("%s is not attached at %s; it rejoins the recording "
+                       "when it is plugged back in", cam_id, usb_path)
+        workers.append(CameraWorker(
+            cam_id=cam_id, uid="", role=role, side=cam.get("side", ""),
+            usb_path=usb_path, product=cam.get("product", ""),
+            width=width, height=height, fps=fps,
+            bandwidth_factor=cfg.bandwidth_factor,
+            controls=cfg.controls_for(cam_id),
+            guard=guard,
+        ))
+        present |= {usb_path, cam_id}
     # Open the world cameras first, one camera at a time.  When the bus runs out
     # of bandwidth it is whichever camera is being opened that wedges, so this
     # order decides what is lost: an eye camera rather than a headset's main
@@ -737,17 +887,21 @@ def build_workers(cfg, guard=None) -> list[CameraWorker]:
 
 
 class CameraSupervisor(threading.Thread):
-    """Reports cameras that appear after start-up, without touching them.
+    """Reports cameras on ports nobody is responsible for, without touching them.
 
-    It cannot simply adopt one.  pyuvc enumerates devices inside both
-    uvc.device_list() and the Capture constructor, and that call blocks
-    indefinitely while other cameras are streaming -- with the GIL held, so the
-    whole process stops answering.  It was measured doing exactly that: a
-    camera plugged back in was detected, the open never returned, and systemd
-    had to SIGKILL the recorder.
+    A camera that comes back to a port this run already has a worker for is
+    that worker's business: it watches the port and reopens the camera itself
+    (CameraWorker._device_ready).  What is left for this thread is a camera on
+    a port no worker knows, which would need a new worker -- and a new name,
+    and a place in a recording already under way -- so it is reported for the
+    operator to pick up with a restart.
 
-    So discovery here is pure sysfs, and a newly attached camera is surfaced to
-    the operator to pick up with a restart, which is quick and always works.
+    The reopen was once measured freezing the recorder: the open never
+    returned and systemd had to SIGKILL it.  That open waited for its first
+    frame with no timeout, which FIRST_FRAME_TIMEOUT now bounds, and it went
+    in the moment the camera appeared, which SETTLE_TIME now prevents.  Should
+    it freeze all the same, the watchdog restarts the process and the
+    recording carries on in the same directory (see recording.find_resumable).
     """
 
     def __init__(self, cfg, on_detect, is_recording, interval: float = 5.0):

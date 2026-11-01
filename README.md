@@ -62,15 +62,47 @@ headset and a single headset, all against synthetic device lists:
 ./.venv/bin/python -m unittest discover -s tests
 ```
 
-**A camera plugged in while the system runs needs a restart to be used.** The UI
-says so when it detects one, and the restart button applies it. This is not
-laziness: pyuvc enumerates devices inside both `uvc.device_list()` and the
-`Capture` constructor, and those calls can block indefinitely while other
-cameras stream -- with the GIL held, which stops every thread in the process.
-That was measured, twice, before the design changed to detect-and-report.
+## Cameras that drop out
 
-Camera discovery therefore reads sysfs rather than asking the capture library,
-which also makes it safe from a background thread.
+**A camera that is unplugged, or whose hub drops off the bus, rejoins by
+itself when it comes back -- recording included.** The recording keeps running
+for every other camera in the meantime; the missing one shows `kihúzva` on its
+tile and its video simply has a gap, which its timestamp table makes exact.
+
+The capture thread watches the camera's USB port in sysfs while it is away
+(once a second, touching no libusb state), lets a returning camera sit for two
+seconds so the hub and kernel finish enumerating it, and only then opens it
+again -- with the same bounded first-frame wait as at start-up, under the same
+lock, and with the stored image controls written back. A camera that stalls
+without leaving the bus is closed and reopened with a back-off, so one that
+keeps failing cannot monopolise the process.
+
+A handle whose device has gone is never closed: `uvc_close` on it blocks with
+the GIL held and stops the whole process. It is kept, not dropped, because
+pyuvc's destructor calls the same close.
+
+**If the recorder freezes all the same, the recording carries on after the
+restart.** The systemd watchdog kills a frozen recorder within 20 s and starts
+it again; a recording that was running is then continued in the same directory,
+as a second part (`left_world.part2.mkv` / `.csv`, and so on), before the HTTP
+server answers anyone -- so neither the iPad nor the sensor and GNSS daemons
+ever see it stopped. A camera still unplugged at that point gets a worker that
+waits for it at its port. `recording.json` lists each part under `segments`,
+marks the interrupted ones, and sums the frames across them. Each part's
+`frame_index` starts at 0; `unix_time` and `monotonic_time` run on across parts.
+
+That happens only within ten minutes of the interruption (`RESUME_WINDOW` in
+`recording.py`): a machine switched back on the next morning does not quietly
+resume a recording nobody is attending. A deliberate stop or restart --
+the button, `systemctl restart`, a shutdown -- finishes the recording as before.
+The timestamp tables are flushed once a second for the same reason: a killed
+process loses at most that much of them.
+
+**A camera on a port this run has never seen still needs a restart.** It would
+need a new name and a place in a recording already under way, so the UI only
+reports it, and the restart button applies it. Camera discovery reads sysfs
+rather than asking the capture library, which makes it safe from a background
+thread while the other cameras stream.
 
 ## Install
 
@@ -120,7 +152,7 @@ three cameras. Do not reach for it again without reading this paragraph.
 
 Two macOS-specific habits worth keeping: stop the machine sleeping
 (`sudo pmset -a disablesleep 1`), because USB devices re-enumerate on wake and
-the recorder deliberately does not reopen cameras mid-session; and remember that
+a sleep cuts every camera at once, which is a gap in the recording at best; and remember that
 launchd hands a daemon a `PATH` without `/usr/local/bin`, so `ffmpeg` has to be
 put back on it in the plist -- without that the recorder streams perfectly and
 every recording fails.

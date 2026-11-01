@@ -69,7 +69,17 @@ class OpenGuard:
             return
         self.quarantined = dict(stored.get("quarantined") or {})
         in_flight = stored.get("in_flight")
-        if in_flight and in_flight.get("cam_id"):
+        if in_flight and in_flight.get("phase") == "reopen":
+            # Died reopening a camera that had come back mid-session.  That
+            # says something about a hub settling after a replug, not about
+            # whether the camera fits on the bus: the start-up open that
+            # follows is the ordinary, serialised one that works.  Leaving the
+            # camera out would cost it for the rest of a recording that is
+            # about to be resumed.
+            logger.warning("%s froze the recorder while being reopened; "
+                           "trying it again at this start",
+                           in_flight.get("cam_id"))
+        elif in_flight and in_flight.get("cam_id"):
             # The recorder died between the two writes below, which is the
             # signature of a camera that took the whole process down with it.
             cam_id = in_flight["cam_id"]
@@ -109,14 +119,16 @@ class OpenGuard:
         return cam_id in self.quarantined
 
     @contextlib.contextmanager
-    def attempting(self, cam_id: str, usb_path: str):
+    def attempting(self, cam_id: str, usb_path: str, phase: str = "start"):
         """Leave the note for as long as this camera is being opened.
 
         Only one camera can be inside this at a time -- the caller holds the
         device lock -- so one note is enough to name the camera at fault.
+        `phase` is "start" for a camera's first open in this run and "reopen"
+        for one that came back mid-session; only the first quarantines.
         """
         self._in_flight = {"cam_id": cam_id, "usb_path": usb_path,
-                           "started_unix": time.time()}
+                           "phase": phase, "started_unix": time.time()}
         self._write()
         try:
             yield
@@ -150,7 +162,7 @@ class NoGuard:
         return False
 
     @contextlib.contextmanager
-    def attempting(self, cam_id: str, usb_path: str):
+    def attempting(self, cam_id: str, usb_path: str, phase: str = "start"):
         yield
 
     def clear(self) -> list[str]:

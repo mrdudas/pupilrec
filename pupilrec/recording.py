@@ -28,6 +28,28 @@ CSV_HEADER = "frame_index,unix_time,iso_time,monotonic_time,device_time,uvc_inde
 
 FFMPEG = "ffmpeg"
 
+# How often a sink pushes its timestamp table to the kernel.  The table is
+# buffered in this process, and a recorder that freezes is killed by the
+# watchdog with the buffer still in it: the video would keep frames whose
+# times were lost.  Once a second bounds that loss to a second.
+TABLE_FLUSH_INTERVAL = 1.0
+
+# The note that a recording is running, next to the quarantine note.  A run
+# that finds it at start-up was killed mid-recording -- by the watchdog, as a
+# rule, after a camera froze the process -- and carries on in the same
+# directory rather than leaving the operator with a stopped recording that
+# nobody stopped.
+ACTIVE_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "var",
+    "active_recording.json")
+# The note is refreshed this often while the recording runs...
+HEARTBEAT_INTERVAL = 5.0
+# ...and is only acted on if it was refreshed this recently.  A restart within
+# seconds of a freeze is the case this is for.  A machine switched back on
+# the next morning is not: resuming a recording nobody is attending would
+# quietly fill the disk.
+RESUME_WINDOW = 600.0
+
 
 def ffmpeg_path() -> str:
     """Where ffmpeg is, or "" if it is not on PATH.
@@ -86,11 +108,15 @@ class CameraSink:
     camera sharing the USB bus.
     """
 
-    def __init__(self, directory: str, cam_id: str, width: int, height: int, fps: int):
+    def __init__(self, directory: str, cam_id: str, width: int, height: int, fps: int,
+                 segment: int = 1):
         self.cam_id = cam_id
         self.fps = fps
-        self.video_path = os.path.join(directory, f"{cam_id}.mkv")
-        self.table_path = os.path.join(directory, f"{cam_id}.csv")
+        # The first segment keeps the plain names every existing recording
+        # has; one resumed after a restart must not overwrite them.
+        stem = segment_stem(cam_id, segment)
+        self.video_path = os.path.join(directory, f"{stem}.mkv")
+        self.table_path = os.path.join(directory, f"{stem}.csv")
 
         self.written = 0
         self.dropped_queue = 0
@@ -125,8 +151,22 @@ class CameraSink:
             self.dropped_queue += 1
 
     def _run(self) -> None:
+        flushed = time.monotonic()
         while True:
-            item = self._queue.get()
+            try:
+                item = self._queue.get(timeout=TABLE_FLUSH_INTERVAL)
+            except queue.Empty:
+                item = None             # a camera that is away: flush anyway
+            now = time.monotonic()
+            if now - flushed >= TABLE_FLUSH_INTERVAL:
+                flushed = now
+                try:
+                    self._table.flush()
+                except (OSError, ValueError):
+                    logger.exception("%s: could not flush the timestamp table",
+                                     self.cam_id)
+            if item is None:
+                continue
             if item is self._stop:
                 break
             try:
@@ -180,71 +220,327 @@ class CameraSink:
         }
 
 
+def segment_stem(cam_id: str, segment: int) -> str:
+    """File name, without extension, of one camera's part of one segment."""
+    return cam_id if segment <= 1 else f"{cam_id}.part{segment}"
+
+
+def _table_summary(path: str) -> tuple[int, float | None]:
+    """(rows, last unix_time) of a timestamp table a killed process left behind.
+
+    Tolerates a last line cut off mid-write: it is not counted.
+    """
+    try:
+        with open(path, "rb") as fh:
+            data = fh.read()
+    except OSError:
+        return 0, None
+    lines = data.split(b"\n")
+    complete = [line for line in lines[1:-1] if line]   # header, and the unterminated tail
+    last = None
+    if complete:
+        try:
+            last = float(complete[-1].split(b",")[1])
+        except (IndexError, ValueError):
+            pass
+    return len(complete), last
+
+
+class ActiveNote:
+    """The note on disk that says a recording is running, and where.
+
+    Written when a recording starts, refreshed while it runs, removed when it
+    is stopped.  Only a process that dies without stopping leaves it behind.
+    """
+
+    def __init__(self, path: str | None):
+        self.path = path
+        self._payload: dict = {}
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self, directory: str, started_by: str) -> None:
+        if not self.path:
+            return
+        self._payload = {"directory": directory, "started_by": started_by}
+        self._write()
+        self._thread = threading.Thread(target=self._beat, name="recording-note",
+                                        daemon=True)
+        self._thread.start()
+
+    def _beat(self) -> None:
+        while not self._stop.wait(HEARTBEAT_INTERVAL):
+            self._write()
+
+    def _write(self) -> None:
+        payload = dict(self._payload, alive_unix=time.time())
+        try:
+            os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
+            tmp = self.path + ".tmp"
+            with open(tmp, "w") as fh:
+                json.dump(payload, fh)
+                fh.write("\n")
+            os.replace(tmp, self.path)
+        except OSError as exc:
+            # Costs the resume after a crash, never the recording itself.
+            logger.warning("could not write %s: %s", self.path, exc)
+
+    def clear(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=5)
+        if self.path:
+            try:
+                os.remove(self.path)
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                logger.warning("could not remove %s: %s", self.path, exc)
+
+
+def find_resumable(recordings_dir: str, path: str = ACTIVE_PATH,
+                   window: float = RESUME_WINDOW) -> dict | None:
+    """The recording a killed run left unfinished, if it should be continued.
+
+    -> {"directory", "started_by", "meta", "cameras"} or None.  A note that is
+    too old, or that points at something that is not an unfinished recording
+    in this recordings directory, is removed and ignored.
+    """
+    try:
+        with open(path) as fh:
+            note = json.load(fh)
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as exc:
+        logger.warning("ignoring unreadable %s: %s", path, exc)
+        note = {}
+
+    def discard(why: str) -> None:
+        logger.warning("not resuming the interrupted recording: %s", why)
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+    directory = note.get("directory") or ""
+    age = time.time() - float(note.get("alive_unix") or 0)
+    if age > window:
+        discard(f"it stopped {age / 60:.0f} minutes ago")
+        return None
+    root = os.path.realpath(recordings_dir)
+    if not directory or os.path.dirname(os.path.realpath(directory)) != root:
+        discard(f"{directory!r} is not in {recordings_dir}")
+        return None
+    try:
+        with open(os.path.join(directory, "recording.json")) as fh:
+            meta = json.load(fh)
+    except (OSError, ValueError) as exc:
+        discard(f"{directory}: {exc}")
+        return None
+    if meta.get("complete"):
+        discard(f"{directory} was finished")
+        return None
+    cameras = {c["camera"]: c for c in meta.get("cameras", []) if c.get("camera")}
+    for segment in meta.get("segments", []):
+        for cam in segment.get("cameras", []):
+            if cam.get("camera"):
+                cameras.setdefault(cam["camera"], cam)
+    return {"directory": directory, "started_by": note.get("started_by", ""),
+            "alive_unix": note.get("alive_unix"), "meta": meta,
+            "cameras": list(cameras.values())}
+
+
 class RecordingSession:
-    """One directory holding a synchronised set of recordings."""
+    """One directory holding a synchronised set of recordings.
 
-    def __init__(self, root: str, workers, name: str = ""):
-        self.name = join_name(datetime.now().strftime(STAMP_FORMAT), name)
-        self.directory = os.path.join(root, self.name)
-        os.makedirs(self.directory, exist_ok=False)
+    Normally one segment.  A recording interrupted by the process dying -- the
+    watchdog killing a recorder a camera froze -- is continued by the next run
+    as a further segment in the same directory: `<camera>.part2.mkv` and its
+    table, and so on.  Each segment's frame_index starts at 0; unix_time and
+    monotonic_time run on across segments, so the tables still line up.
+    """
 
-        self.started_unix = time.time()
+    def __init__(self, root: str, workers, name: str = "",
+                 note_path: str | None = None, started_by: str = "",
+                 resume: dict | None = None):
+        if resume:
+            self.directory = resume["directory"]
+            self.name = os.path.basename(self.directory)
+            meta = resume["meta"]
+            self.started_unix = meta.get("started_unix") or time.time()
+            self._known_cameras = list(resume.get("cameras") or meta.get("cameras", []))
+            self._segments = self._close_interrupted(meta, resume.get("alive_unix"))
+        else:
+            self.name = join_name(datetime.now().strftime(STAMP_FORMAT), name)
+            self.directory = os.path.join(root, self.name)
+            os.makedirs(self.directory, exist_ok=False)
+            self.started_unix = None
+            self._known_cameras = []
+            self._segments = []
+
+        self.segment = len(self._segments) + 1
+        self.segment_started_unix = time.time()
         self.started_monotonic = time.monotonic()
+        if self.started_unix is None:
+            self.started_unix = self.segment_started_unix
+        # So that elapsed counts from the start of the whole recording.
+        self._elapsed_base = self.segment_started_unix - self.started_unix
         self.stopped_unix = None
         self._workers = list(workers)
         self._sinks: dict[str, CameraSink] = {}
+        # Frames already on disk from earlier segments, for the live counts.
+        self._prior_frames: dict[str, int] = {}
+        for seg in self._segments:
+            for r in seg.get("results") or []:
+                self._prior_frames[r["camera"]] = (
+                    self._prior_frames.get(r["camera"], 0) + int(r.get("frames") or 0))
 
         for worker in self._workers:
             sink = CameraSink(self.directory, worker.cam_id,
-                              worker.width, worker.height, worker.fps)
+                              worker.width, worker.height, worker.fps,
+                              segment=self.segment)
             self._sinks[worker.cam_id] = sink
             worker.attach_sink(sink)
 
         self._write_metadata(final=False)
-        logger.info("recording started: %s", self.directory)
+        self._note = ActiveNote(note_path)
+        self._note.start(self.directory, started_by)
+        if resume:
+            logger.warning("recording resumed after an interruption: %s (segment %d)",
+                           self.directory, self.segment)
+        else:
+            logger.info("recording started: %s", self.directory)
+
+    @property
+    def resumed(self) -> bool:
+        return self.segment > 1
+
+    def _close_interrupted(self, meta: dict, alive_unix) -> list[dict]:
+        """Earlier segments, with the one the dead process left open filled in."""
+        segments = [dict(seg) for seg in meta.get("segments") or []]
+        if not segments:
+            # Written before recordings had segments: it was all one.
+            segments = [{
+                "index": 1,
+                "started_unix": meta.get("started_unix"),
+                "clock_offset_unix_minus_monotonic":
+                    meta.get("clock_offset_unix_minus_monotonic"),
+                "cameras": meta.get("cameras", []),
+                "stopped_unix": None,
+            }]
+        last = segments[-1]
+        if last.get("stopped_unix") is None:
+            results, ends = [], []
+            for cam in last.get("cameras", []):
+                table = os.path.join(self.directory, cam["table"])
+                video = os.path.join(self.directory, cam["video"])
+                rows, last_unix = _table_summary(table)
+                if last_unix is not None:
+                    ends.append(last_unix)
+                results.append({
+                    "camera": cam["camera"], "video": cam["video"],
+                    "table": cam["table"], "frames": rows,
+                    "last_unix": last_unix,
+                    "size_bytes": os.path.getsize(video) if os.path.exists(video) else 0,
+                })
+            last["results"] = results
+            last["stopped_unix"] = max(ends) if ends else alive_unix
+            last["ended"] = "interrupted"
+        return segments
 
     @property
     def elapsed(self) -> float:
-        return time.monotonic() - self.started_monotonic
+        return self._elapsed_base + time.monotonic() - self.started_monotonic
 
     def live_counts(self) -> dict[str, dict]:
         return {
-            cam_id: {"frames": s.written, "dropped_queue": s.dropped_queue}
+            cam_id: {"frames": self._prior_frames.get(cam_id, 0) + s.written,
+                     "dropped_queue": s.dropped_queue}
             for cam_id, s in self._sinks.items()
         }
 
-    def _camera_meta(self) -> list[dict]:
+    def _camera_meta(self, segment: int) -> list[dict]:
         return [
             {
                 "camera": w.cam_id, "side": w.side, "role": w.role,
                 "product": w.product, "usb_path": w.usb_path, "uid": w.uid,
                 "width": w.width, "height": w.height, "nominal_fps": w.fps,
-                "video": f"{w.cam_id}.mkv", "table": f"{w.cam_id}.csv",
+                "video": f"{segment_stem(w.cam_id, segment)}.mkv",
+                "table": f"{segment_stem(w.cam_id, segment)}.csv",
             }
             for w in self._workers
         ]
 
+    def _all_cameras(self) -> list[dict]:
+        """Every camera of the recording under its first segment's file names."""
+        cams = {c["camera"]: c for c in self._known_cameras if c.get("camera")}
+        for cam in self._camera_meta(1):
+            cams.setdefault(cam["camera"], cam)
+        return [cams[k] for k in sorted(cams)]
+
+    def _current_segment(self, results=None) -> dict:
+        seg = {
+            "index": self.segment,
+            "started_unix": self.segment_started_unix,
+            "clock_offset_unix_minus_monotonic":
+                self.segment_started_unix - self.started_monotonic,
+            "cameras": self._camera_meta(self.segment),
+            "stopped_unix": self.stopped_unix,
+        }
+        if results is not None:
+            seg["ended"] = "stopped"
+            seg["results"] = results
+        return seg
+
     def _write_metadata(self, final: bool, results=None) -> None:
+        segments = self._segments + [self._current_segment(results if final else None)]
         meta = {
             "name": self.name,
             "started_unix": self.started_unix,
             "started_iso": datetime.fromtimestamp(self.started_unix).isoformat(timespec="microseconds"),
             # Lets the monotonic column in each CSV be mapped onto wall clock time
-            # even if the system clock is adjusted mid-recording.
-            "clock_offset_unix_minus_monotonic": self.started_unix - self.started_monotonic,
+            # even if the system clock is adjusted mid-recording.  Per segment
+            # in "segments"; this one is the first segment's.
+            "clock_offset_unix_minus_monotonic":
+                segments[0].get("clock_offset_unix_minus_monotonic"),
             "video_codec": "mjpeg (stream copy, no re-encode)",
             "container": "matroska",
-            "cameras": self._camera_meta(),
+            "cameras": self._all_cameras(),
+            "segments": segments,
             "complete": final,
         }
         if final:
             meta["stopped_unix"] = self.stopped_unix
             meta["stopped_iso"] = datetime.fromtimestamp(self.stopped_unix).isoformat(timespec="microseconds")
             meta["duration_s"] = round(self.stopped_unix - self.started_unix, 3)
-            meta["results"] = results
-        with open(os.path.join(self.directory, "recording.json"), "w") as fh:
+            meta["interruptions"] = sum(1 for s in segments if s.get("ended") == "interrupted")
+            meta["results"] = (results if len(segments) == 1
+                               else self._combined_results(segments))
+        path = os.path.join(self.directory, "recording.json")
+        tmp = path + ".tmp"
+        # Through a rename: this file is rewritten on a resume, and a process
+        # killed half way through writing it would otherwise lose the record of
+        # every earlier segment.
+        with open(tmp, "w") as fh:
             json.dump(meta, fh, indent=2)
             fh.write("\n")
+        os.replace(tmp, path)
+
+    @staticmethod
+    def _combined_results(segments: list[dict]) -> list[dict]:
+        """One entry per camera, summed over every segment it appears in."""
+        combined: dict[str, dict] = {}
+        for seg in segments:
+            for r in seg.get("results") or []:
+                c = combined.setdefault(r["camera"], {
+                    "camera": r["camera"], "frames": 0, "dropped_queue": 0,
+                    "size_bytes": 0, "videos": [], "tables": []})
+                c["frames"] += int(r.get("frames") or 0)
+                c["dropped_queue"] += int(r.get("dropped_queue") or 0)
+                c["size_bytes"] += int(r.get("size_bytes") or 0)
+                c["videos"].append(r.get("video"))
+                c["tables"].append(r.get("table"))
+        return [combined[k] for k in sorted(combined)]
 
     def stop(self) -> dict:
         for worker in self._workers:
@@ -252,10 +548,15 @@ class RecordingSession:
         results = [self._sinks[w.cam_id].close() for w in self._workers]
         self.stopped_unix = time.time()
         self._write_metadata(final=True, results=results)
+        self._note.clear()
         logger.info("recording stopped: %s", self.directory)
+        totals = {cam_id: c["frames"] for cam_id, c in self.live_counts().items()}
+        cameras = [dict(r, frames=totals.get(r["camera"], r["frames"]))
+                   for r in results]
         return {
             "name": self.name,
             "directory": self.directory,
             "duration_s": round(self.stopped_unix - self.started_unix, 3),
-            "cameras": results,
+            "segments": self.segment,
+            "cameras": cameras,
         }

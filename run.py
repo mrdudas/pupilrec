@@ -19,7 +19,7 @@ from pupilrec import systemd
 from pupilrec.capture import CameraSupervisor, build_workers
 from pupilrec.config import Config
 from pupilrec.quarantine import STATE_PATH, OpenGuard, signature_of
-from pupilrec.recording import ffmpeg_path
+from pupilrec.recording import ACTIVE_PATH, ffmpeg_path, find_resumable
 from pupilrec.server import local_addresses, serve
 from pupilrec.usbmap import discover_sysfs
 
@@ -97,8 +97,16 @@ def main() -> int:
             print(f"  {cam_id}")
         return 0
 
+    # A recording the previous run was killed in the middle of -- the watchdog
+    # restarting a recorder that a camera froze.  Its cameras get workers even
+    # if one is unplugged right now, so that it rejoins when it comes back.
+    resume = None
+    if not args.list:
+        resume = find_resumable(cfg.recordings_dir, ACTIVE_PATH)
+
     try:
-        workers = build_workers(cfg, guard)
+        workers = build_workers(cfg, guard,
+                                expected=resume["cameras"] if resume else None)
     except RuntimeError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
@@ -114,7 +122,19 @@ def main() -> int:
     for worker in workers:
         worker.start()
 
-    httpd, state = serve(cfg, workers, guard)
+    httpd, state = serve(cfg, workers, guard, note_path=ACTIVE_PATH)
+
+    # Before serve_forever, so the first status anyone gets already says the
+    # recording is running: see AppState.resume_recording.
+    if resume is not None:
+        try:
+            if not ffmpeg_path():
+                raise RuntimeError("ffmpeg is not on PATH")
+            resumed = state.resume_recording(resume)
+            print(f"  Resumed the interrupted recording {resumed['name']} "
+                  f"(segment {resumed['segment']}).")
+        except Exception:
+            logging.exception("could not resume the interrupted recording")
 
     # Headsets are optional and may be plugged in later.  The supervisor cannot
     # start such a camera itself, but it can say one is waiting.

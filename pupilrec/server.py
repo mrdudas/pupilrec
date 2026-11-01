@@ -75,8 +75,11 @@ class AppState:
     without any of them disagreeing about whether a recording is running.
     """
 
-    def __init__(self, cfg, workers, guard=None):
+    def __init__(self, cfg, workers, guard=None, note_path=None):
         self.cfg = cfg
+        # Where a running recording leaves its note, so that a run killed in
+        # the middle of one can continue it.  None in tests: nothing to resume.
+        self.note_path = note_path
         self.workers = {w.cam_id: w for w in workers}
         # Cameras left out of this run because they froze the last one.  They
         # have no worker, so nothing else in here would know they exist.
@@ -129,8 +132,9 @@ class AppState:
     def note_attached(self, attached) -> None:
         """Record which cameras are plugged in but not part of this session.
 
-        Opening one now would freeze the process (see CameraSupervisor), so a
-        newly attached camera is only reported; a restart picks it up.
+        A camera back at a port that already has a worker is reopened by that
+        worker.  One on a port nobody knows would need a new worker, so it is
+        only reported; a restart picks it up (see CameraSupervisor).
         """
         known = {w.usb_path for w in self.workers.values()}
         self.pending_cameras = [
@@ -246,12 +250,33 @@ class AppState:
                 )
             os.makedirs(self.cfg.recordings_dir, exist_ok=True)
             self.session = RecordingSession(
-                self.cfg.recordings_dir, self.workers.values(), name
+                self.cfg.recordings_dir, self.workers.values(), name,
+                note_path=self.note_path, started_by=client,
             )
             self.started_by = client
             self.state_version += 1
             return {"name": self.session.name, "directory": self.session.directory,
                     "state_version": self.state_version}
+
+    def resume_recording(self, resume: dict) -> dict:
+        """Carry on with a recording a killed run left unfinished.
+
+        Done before the HTTP server answers its first request, so a client --
+        or the sensor and GNSS daemons, which follow /api/status -- never sees
+        the recording as stopped: from outside, it was unreachable for a few
+        seconds and then carried on under the same name, in the same directory.
+        """
+        with self.lock:
+            if self.session is not None:
+                raise AlreadyRecording(self.session.name, self.started_by)
+            self.session = RecordingSession(
+                self.cfg.recordings_dir, self.workers.values(),
+                note_path=self.note_path, started_by=resume.get("started_by", ""),
+                resume=resume,
+            )
+            self.started_by = resume.get("started_by", "")
+            self.state_version += 1
+            return {"name": self.session.name, "segment": self.session.segment}
 
     def stop_recording(self, client: str = "") -> dict:
         with self.lock:
@@ -302,6 +327,9 @@ class AppState:
             # The sensor daemon writes its CSVs into this same directory.
             "recording_directory": session.directory if session else None,
             "elapsed_s": round(session.elapsed, 1) if session else 0.0,
+            # Above 1 when the recorder was restarted mid-recording and
+            # carried on; the UI says so, because there is a gap in it.
+            "segment": session.segment if session else 0,
             "state_version": self.state_version,
             "started_by": self.started_by if session else "",
             "stopped_by": self.stopped_by,
@@ -783,8 +811,8 @@ class BrightnessSampler(threading.Thread):
                     logger.exception("could not measure %s", worker.cam_id)
 
 
-def serve(cfg, workers, guard=None):
-    state = AppState(cfg, workers, guard)
+def serve(cfg, workers, guard=None, note_path=None):
+    state = AppState(cfg, workers, guard, note_path)
     Handler.state = state
     httpd = Server((cfg.host, cfg.port), Handler)
     BrightnessSampler(workers).start()
